@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Reste</title>
+  <meta name="application-name" content="Reste" />
+  <meta name="apple-mobile-web-app-title" content="Reste" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="theme-color" content="#132a26" />
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png" />
+  <link rel="icon" type="image/svg+xml" href="./icon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&family=Playfair+Display:ital,wght@0,600;0,700;1,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand-wrap">
+        <div class="brand-badge" aria-hidden="true">R</div>
+        <div>
+          <div class="topbar-title">Reste</div>
+          <div class="topbar-sub" id="topbar-sub">Household Budget Planner</div>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <button class="icon-btn hidden" id="quick-spend-top" title="Quick log spend" aria-label="Log spend">＋</button>
+        <button class="icon-btn" id="dark-toggle" title="Toggle dark mode" aria-label="Toggle dark mode">🌙</button>
+        <button class="icon-btn hidden" id="account-top-btn" title="Household &amp; Account" aria-label="Household & Account">👤</button>
+      </div>
+    </header>
+
+    <div class="sync-bar hidden" id="sync-bar">
+      <div class="sync-bar-left">
+        <div class="sync-dot"></div>
+        <span id="sync-txt">Connecting to live sync…</span>
+      </div>
+      <span class="presence-pill hidden" id="presence-pill"></span>
+    </div>
+
+    <main class="content" id="main-content">
+      <!-- Loading Gate -->
+      <section id="view-loading" class="gate-wrap">
+        <div class="gate-hero">
+          <img src="./icon-192.png" alt="Reste logo" class="gate-logo" />
+          <div class="gate-title">Reste</div>
+          <div class="gate-sub">Restoring your permanent household ledger…</div>
+        </div>
+      </section>
+
+      <!-- Auth Gate -->
+      <section id="view-auth" class="gate-wrap hidden">
+        <div class="gate-hero">
+          <img src="./icon-192.png" alt="Reste logo" class="gate-logo" />
+          <div class="gate-title">Reste</div>
+          <div class="gate-sub">Your shared household budget, always in sync and saved permanently in the cloud.</div>
+        </div>
+
+        <div class="card">
+          <div class="seg-tabs">
+            <button class="seg-tab on" id="auth-tab-login" type="button">Sign in</button>
+            <button class="seg-tab" id="auth-tab-signup" type="button">Create account</button>
+          </div>
+
+          <div id="auth-msg" class="hidden"></div>
+
+          <form id="auth-form">
+            <div class="fg hidden" id="signup-name-group">
+              <label class="fl" for="auth-display-name">Your Name</label>
+              <input class="fi" id="auth-display-name" type="text" placeholder="e.g. Alex or Sam" autocomplete="name" />
+            </div>
+
+            <div class="fg">
+              <label class="fl" for="auth-ident">Username or Email</label>
+              <input class="fi" id="auth-ident" type="text" placeholder="e.g. alex or alex@example.com" autocomplete="username" required />
+            </div>
+
+            <div class="fg">
+              <label class="fl" for="auth-password">Password</label>
+              <input class="fi" id="auth-password" type="password" placeholder="At least 6 characters" autocomplete="current-password" minlength="6" required />
+            </div>
+
+            <div class="fg hidden" id="signup-confirm-group">
+              <label class="fl" for="auth-password-confirm">Confirm Password</label>
+              <input class="fi" id="auth-password-confirm" type="password" placeholder="Re-enter password" autocomplete="new-password" minlength="6" />
+            </div>
+
+            <button class="btn btn-primary btn-full" id="auth-submit-btn" type="submit">Sign in</button>
+          </form>
+        </div>
+      </section>
+
+      <!-- Household Onboarding Gate -->
+      <section id="view-household-setup" class="gate-wrap hidden">
+        <div class="gate-hero">
+          <img src="./icon-192.png" alt="Reste logo" class="gate-logo" />
+          <div class="gate-title">Welcome, <span id="setup-user-name">friend</span></div>
+          <div class="gate-sub">Create a new household to get a share code, or join your partner's existing household.</div>
+        </div>
+
+        <div id="setup-msg" class="hidden"></div>
+
+        <div class="card">
+          <div class="sec-hdr">
+            <div>
+              <div class="sec-title">Create a Household</div>
+              <div class="sec-sub">Start your shared planner &amp; generate an invite code</div>
+            </div>
+          </div>
+          <form id="create-household-form">
+            <div class="fg">
+              <label class="fl" for="create-hh-name">Household Name</label>
+              <input class="fi" id="create-hh-name" type="text" placeholder="e.g. Our Household" required />
+            </div>
+            <div class="frow">
+              <div class="fg">
+                <label class="fl" for="create-pa-name">Partner 1 Name</label>
+                <input class="fi" id="create-pa-name" type="text" placeholder="e.g. Partner 1" required />
+              </div>
+              <div class="fg">
+                <label class="fl" for="create-pb-name">Partner 2 Name</label>
+                <input class="fi" id="create-pb-name" type="text" placeholder="e.g. Partner 2" required />
+              </div>
+            </div>
+            <button class="btn btn-primary btn-full" type="submit" id="create-hh-btn">Create Household</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <div class="sec-hdr">
+            <div>
+              <div class="sec-title">Join with a Share Code</div>
+              <div class="sec-sub">Enter the share code from your partner or invite</div>
+            </div>
+          </div>
+          <form id="join-household-form">
+            <div class="fg">
+              <label class="fl" for="join-code-input">Household Share Code</label>
+              <input class="fi mono" id="join-code-input" type="text" placeholder="e.g. A7K9P2" maxlength="16" style="text-transform:uppercase;letter-spacing:0.18em;font-weight:700;" required />
+            </div>
+            <button class="btn btn-gold btn-full" type="submit" id="join-hh-btn">Join Household</button>
+          </form>
+        </div>
+
+        <button class="btn btn-full" id="setup-signout-btn" type="button">Sign out</button>
+      </section>
+
+      <!-- Main App Panels -->
+      <section id="panel-overview" class="panel"></section>
+      <section id="panel-joint" class="panel"></section>
+      <section id="panel-spend" class="panel"></section>
+      <section id="panel-personal" class="panel"></section>
+      <section id="panel-household" class="panel"></section>
+    </main>
+
+    <nav class="bottom-nav hidden" id="bottom-nav" aria-label="Primary navigation">
+      <button class="nav-item active" data-tab="overview" type="button">
+        <span class="nav-icon">◎</span>
+        <span>Overview</span>
+      </button>
+      <button class="nav-item" data-tab="joint" type="button">
+        <span class="nav-icon">⇄</span>
+        <span>Joint</span>
+      </button>
+      <button class="nav-item" data-tab="spend" type="button">
+        <span class="nav-icon">🧾</span>
+        <span>Spend</span>
+      </button>
+      <button class="nav-item" data-tab="personal" type="button">
+        <span class="nav-icon">👥</span>
+        <span>Personal</span>
+      </button>
+      <button class="nav-item" data-tab="household" type="button">
+        <span class="nav-icon">⌂</span>
+        <span>Household</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Reusable Bottom-Sheet Modal -->
+  <div class="overlay" id="modal-overlay" role="dialog" aria-modal="true">
+    <div class="sheet" id="modal-sheet">
+      <div class="sheet-handle"></div>
+      <div class="sheet-title" id="modal-title"></div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
