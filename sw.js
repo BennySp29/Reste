@@ -1,10 +1,11 @@
-const CACHE_NAME = 'reste-shell-v4';
+const APP_VERSION = 'v5';
+const CACHE_NAME = `reste-shell-${APP_VERSION}`;
 const SHELL_ASSETS = [
   './',
   './index.html',
-  './styles.css',
-  './app.js',
-  './budget-engine.js',
+  './styles.css?v=5',
+  './app.js?v=5',
+  './budget-engine.js?v=5',
   './manifest.json',
   './icon.svg',
   './icon-192.png',
@@ -12,20 +13,64 @@ const SHELL_ASSETS = [
   './icon-maskable-192.png',
   './icon-maskable-512.png',
   './apple-touch-icon.png',
-  './favicon-32.png'
+  './favicon-32.png',
 ];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL_ASSETS)).then(() => self.skipWaiting())
+    caches
+      .open(CACHE_NAME)
+      .then((cache) =>
+        Promise.all(
+          SHELL_ASSETS.map(async (assetUrl) => {
+            const req = new Request(assetUrl, { cache: 'reload' });
+            const res = await fetch(req);
+            if (res && res.ok) {
+              await cache.put(assetUrl, res);
+            }
+          })
+        )
+      )
+      .then(() => self.skipWaiting())
   );
+});
+
+self.addEventListener('message', (event) => {
+  if (event?.data?.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
-    ).then(() => self.clients.claim())
+    (async () => {
+      const keys = await caches.keys();
+      const oldKeys = keys.filter((k) => k !== CACHE_NAME);
+      const hadOldCaches = oldKeys.length > 0;
+      await Promise.all(oldKeys.map((k) => caches.delete(k)));
+      await self.clients.claim();
+
+      if (hadOldCaches) {
+        const windowClients = await self.clients.matchAll({
+          type: 'window',
+          includeUncontrolled: true,
+        });
+        for (const client of windowClients) {
+          try {
+            client.postMessage({ type: 'SW_UPDATED', version: APP_VERSION });
+          } catch (_) {
+            // ignore
+          }
+          if ('navigate' in client) {
+            try {
+              await client.navigate(client.url);
+            } catch (_) {
+              // ignore if navigation blocked
+            }
+          }
+        }
+      }
+    })()
   );
 });
 
@@ -40,13 +85,13 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Only handle same-origin app shell assets with network-first + cache fallback
+  // Only handle same-origin app shell assets with network-first + cache validation
   if (url.origin !== self.location.origin) {
     return;
   }
 
   event.respondWith(
-    fetch(req)
+    fetch(req, { cache: 'no-cache' })
       .then((res) => {
         if (res && res.status === 200) {
           const copy = res.clone();
@@ -54,6 +99,11 @@ self.addEventListener('fetch', (event) => {
         }
         return res;
       })
-      .catch(() => caches.match(req).then((cached) => cached || caches.match('./index.html')))
+      .catch(() =>
+        caches
+          .match(req)
+          .then((cached) => cached || caches.match(req, { ignoreSearch: true }))
+          .then((cached) => cached || caches.match('./index.html'))
+      )
   );
 });

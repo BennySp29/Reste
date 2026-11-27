@@ -4,7 +4,9 @@ import {
   FREQUENCY_OPTIONS,
   computeBudgetModel,
   computeMonthlyAmount,
-} from './budget-engine.js';
+} from './budget-engine.js?v=5';
+
+const APP_VERSION = '1.5';
 
 const SUPABASE_URL = 'https://rpegjcnwtsjdbqrxxzrm.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_3QFbL-uHbTadq5eQpUdDiA_hTicgtOL';
@@ -176,10 +178,58 @@ function applyDarkMode() {
   if (metaTheme) metaTheme.setAttribute('content', state.darkMode ? '#091210' : '#132a26');
 }
 
+let swRefreshing = false;
+let lastSwCheck = 0;
+
 function registerSW() {
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch(() => { });
-  }
+  if (!('serviceWorker' in navigator)) return;
+  const hadController = Boolean(navigator.serviceWorker.controller);
+
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || swRefreshing) return;
+    swRefreshing = true;
+    window.location.reload();
+  });
+
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event?.data?.type === 'SW_UPDATED' && !swRefreshing) {
+      swRefreshing = true;
+      window.location.reload();
+    }
+  });
+
+  navigator.serviceWorker
+    .register('./sw.js', { updateViaCache: 'none' })
+    .then((reg) => {
+      const checkUpdate = () => {
+        const now = Date.now();
+        if (now - lastSwCheck < 15000) return;
+        lastSwCheck = now;
+        reg.update().catch(() => {});
+      };
+
+      if (reg.waiting) {
+        reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+      }
+
+      reg.addEventListener('updatefound', () => {
+        const nextWorker = reg.installing;
+        if (!nextWorker) return;
+        nextWorker.addEventListener('statechange', () => {
+          if (nextWorker.state === 'installed' && navigator.serviceWorker.controller) {
+            nextWorker.postMessage({ type: 'SKIP_WAITING' });
+          }
+        });
+      });
+
+      checkUpdate();
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') checkUpdate();
+      });
+      window.addEventListener('focus', checkUpdate);
+      window.addEventListener('online', checkUpdate);
+    })
+    .catch(() => {});
 }
 
 // ─── MODAL SYSTEM ─────────────────────────────────────────────────────────────
@@ -1905,6 +1955,7 @@ function renderHouseholdTab(m) {
         </div>
       </div>
       <div style="display:flex;flex-direction:column;gap:8px;">
+        <button class="btn btn-full" id="force-update-btn" type="button">Check for App Update (v${APP_VERSION})</button>
         <button class="btn btn-full" id="join-other-hh-btn" type="button">Join Another Household with Code</button>
         <button class="btn btn-full" id="change-pw-btn" type="button">Change Password</button>
         <button class="btn btn-danger btn-full" id="signout-btn" type="button">Sign Out</button>
@@ -1985,6 +2036,22 @@ function renderHouseholdTab(m) {
     } catch (err) {
       showToast(err?.message || 'Could not import backup');
     }
+  });
+  $('force-update-btn')?.addEventListener('click', async () => {
+    showToast('Checking for latest Reste update…');
+    try {
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+      if ('serviceWorker' in navigator) {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg) await reg.update();
+      }
+    } catch (_) {
+      // ignore and force reload
+    }
+    window.location.reload();
   });
   $('join-other-hh-btn')?.addEventListener('click', () => openJoinOtherModal());
   $('change-pw-btn')?.addEventListener('click', () => openChangePasswordModal());
