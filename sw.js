@@ -1,11 +1,11 @@
-const APP_VERSION = 'v6';
+const APP_VERSION = 'v7';
 const CACHE_NAME = `reste-shell-${APP_VERSION}`;
 const SHELL_ASSETS = [
   './',
   './index.html',
-  './styles.css?v=6',
-  './app.js?v=6',
-  './budget-engine.js?v=6',
+  './styles.css?v=7',
+  './app.js?v=7',
+  './budget-engine.js?v=7',
   './manifest.json',
   './icon.svg',
   './icon-192.png',
@@ -60,13 +60,6 @@ self.addEventListener('activate', (event) => {
             client.postMessage({ type: 'SW_UPDATED', version: APP_VERSION });
           } catch (_) {
             // ignore
-          }
-          if ('navigate' in client) {
-            try {
-              await client.navigate(client.url);
-            } catch (_) {
-              // ignore if navigation blocked
-            }
           }
         }
       }

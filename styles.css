@@ -716,22 +716,7 @@ body.dark .badge.gold {
   font-weight: 600;
 }
 
-/* Split Bar, Slider & Waterfall */
-.split-bar {
-  height: 10px;
-  border-radius: 999px;
-  background: var(--gold);
-  overflow: hidden;
-  display: flex;
-  margin: 10px 0;
-}
-
-.split-bar-a {
-  background: var(--emerald);
-  height: 100%;
-  transition: width 0.25s ease;
-}
-
+/* Split Slider & Waterfall */
 .split-slider-wrap {
   margin: 10px 0 8px;
 }
@@ -744,6 +729,7 @@ body.dark .badge.gold {
   border-radius: 999px;
   outline: none;
   cursor: pointer;
+  touch-action: pan-y;
   background: linear-gradient(to right, var(--emerald) 0%, var(--emerald) 57%, var(--gold) 57%, var(--gold) 100%);
 }
 

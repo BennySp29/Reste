@@ -4,9 +4,9 @@ import {
   FREQUENCY_OPTIONS,
   computeBudgetModel,
   computeMonthlyAmount,
-} from './budget-engine.js?v=6';
+} from './budget-engine.js?v=7';
 
-const APP_VERSION = '1.6';
+const APP_VERSION = '1.7';
 
 const SUPABASE_URL = 'https://rpegjcnwtsjdbqrxxzrm.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_3QFbL-uHbTadq5eQpUdDiA_hTicgtOL';
@@ -437,6 +437,14 @@ function setupRealtime(householdId) {
   state.channel = ch;
 }
 
+function ensureRealtimeConnected() {
+  if (!state.household || !navigator.onLine) return;
+  const chState = state.channel?.state;
+  if (!state.channel || chState === 'closed' || chState === 'errored') {
+    setupRealtime(state.household.id);
+  }
+}
+
 async function broadcastChange(message) {
   if (!state.channel || !state.user) return;
   try {
@@ -608,8 +616,12 @@ async function importJSONBackup(file) {
   }
 
   await sb.from('budget_items').delete().eq('household_id', h.id).in('scope', ['joint', myScope]).throwOnError();
-  await sb.from('spend_logs').delete().eq('household_id', h.id).throwOnError();
-  await sb.from('monthly_snapshots').delete().eq('household_id', h.id).throwOnError();
+  if (Array.isArray(parsed.spend_logs)) {
+    await sb.from('spend_logs').delete().eq('household_id', h.id).throwOnError();
+  }
+  if (Array.isArray(parsed.snapshots)) {
+    await sb.from('monthly_snapshots').delete().eq('household_id', h.id).throwOnError();
+  }
 
   if (parsed.household && typeof parsed.household === 'object') {
     const src = parsed.household;
@@ -622,8 +634,6 @@ async function importJSONBackup(file) {
         partner_b_name: src.partner_b_name || h.partner_b_name,
         split_mode: src.split_mode || h.split_mode,
         partner_a_split: Number(src.partner_a_split ?? h.partner_a_split),
-        partner_a_joint_transfer: Number(src.partner_a_joint_transfer ?? 0),
-        partner_b_joint_transfer: Number(src.partner_b_joint_transfer ?? 0),
         partner_a_joint_optional: Number(src.partner_a_joint_optional ?? 0),
         partner_b_joint_optional: Number(src.partner_b_joint_optional ?? 0),
         expense_categories: Array.isArray(src.expense_categories) ? src.expense_categories : h.expense_categories,
@@ -654,7 +664,11 @@ async function importJSONBackup(file) {
     updated_by_name: actorName,
   }));
 
-  const { data: insertedItems } = await sb.from('budget_items').insert(itemsPayload).select().throwOnError();
+  let insertedItems = [];
+  if (itemsPayload.length) {
+    const { data } = await sb.from('budget_items').insert(itemsPayload).select().throwOnError();
+    insertedItems = data || [];
+  }
   const potByName = {};
   (insertedItems || [])
     .filter((i) => i.scope === 'joint' && i.section === 'budgeted_expense')
@@ -989,15 +1003,20 @@ function bindSplitSlider(rootEl) {
     setAll('[data-live-joint-reste], [data-live-joint-reste-hero]', fmtMoney(live.jointDisposable));
     const myPartner = getMyPersonalScope() === 'partner_b' ? live.partnerB : live.partnerA;
     setAll('[data-live-my-reste]', fmtMoney(myPartner.disposable));
-    setAll('[data-live-pa-reste]', fmtMoney(live.partnerA.disposable));
-    setAll('[data-live-pb-reste]', fmtMoney(live.partnerB.disposable));
-    setAll('[data-live-total-reste]', fmtMoney(live.totalHouseholdDisposable));
   };
 
   slider?.addEventListener('input', (e) => {
     const val = Math.min(100, Math.max(0, Number(e.target.value || 50)));
     h.split_mode = 'custom';
     h.partner_a_split = val / 100;
+    rootEl.querySelector('#split-preset-eq')?.classList.remove('on');
+    rootEl.querySelector('#split-preset-sug-chip')?.classList.remove('on');
+    const sugBtn = rootEl.querySelector('#split-preset-sug');
+    if (sugBtn) {
+      sugBtn.style.borderColor = '';
+      sugBtn.style.background = '';
+      sugBtn.style.color = '';
+    }
     updateLiveDom();
   });
 
@@ -1541,7 +1560,7 @@ function renderSpend(m, activeMonth) {
             <tr><th>Period</th>${histHeaders}</tr>
           </thead>
           <tbody>
-            ${histBody || '<tr><td colspan="4" class="empty-note">No monthly snapshots yet.</td></tr>'}
+            ${histBody || `<tr><td colspan="${1 + potNames.length}" class="empty-note">No monthly snapshots yet.</td></tr>`}
             ${historyRows.length
       ? `<tr><td><strong>Total</strong></td>${totalCells}</tr>
                    <tr><td><strong>Average</strong></td>${avgCells}</tr>`
@@ -1625,8 +1644,9 @@ function renderSpend(m, activeMonth) {
           pot_totals: potTotals,
           summary_json: {
             total_income: m.totalHouseholdIncome,
-            total_expenditure: m.totalHouseholdExpenditure,
-            household_reste: m.totalHouseholdDisposable,
+            joint_inflow: m.jointAccountInflow,
+            joint_expenditure: m.jointExpenseSubtotal,
+            joint_reste: m.jointDisposable,
           },
         },
       },
@@ -2061,7 +2081,6 @@ function renderHouseholdTab(m) {
   $('signout-btn')?.addEventListener('click', async () => {
     teardownRealtime();
     await sb.auth.signOut();
-    state._personalPickedOnce = false;
     state.selectedMonth = null;
     await loadProfileAndHousehold();
   });
@@ -2385,74 +2404,6 @@ function openSpendModal(existingLog = null, presetPot = null) {
   });
 }
 
-function openSplitTransfersModal(m) {
-  const h = state.household;
-  const pA = h.partner_a_name || 'Partner 1';
-  const pB = h.partner_b_name || 'Partner 2';
-
-  openModal('Cost Split & Optional Adjustments', (body) => {
-    body.innerHTML = `
-      <form id="split-modal-form">
-        <div class="fg">
-          <label class="fl" for="sp-mode">Split Method</label>
-          <select class="fi" id="sp-mode">
-            <option value="custom" ${h.split_mode === 'custom' ? 'selected' : ''}>Custom Percentage (${fmtPct(h.partner_a_split)} / ${fmtPct(1 - h.partner_a_split)})</option>
-            <option value="suggested" ${h.split_mode === 'suggested' ? 'selected' : ''}>Suggested by Income (${fmtPct(m.split.suggestedA)} / ${fmtPct(m.split.suggestedB)})</option>
-            <option value="equal" ${h.split_mode === 'equal' ? 'selected' : ''}>50 / 50 Equal Split</option>
-          </select>
-        </div>
-        <div class="fg" id="sp-custom-wrap">
-          <label class="fl" for="sp-pct-a">${esc(pA)}'s Split Percentage (%)</label>
-          <input class="fi num" id="sp-pct-a" type="number" min="0" max="100" step="1" value="${Math.round(Number(h.partner_a_split || 0.5) * 100)}" />
-        </div>
-        <div class="sec-sub" style="margin-bottom:10px;">Joint Transfers automatically round each partner's bills share up to the nearest £50, plus Optional (+/-).</div>
-        <div class="frow">
-          <div class="fg">
-            <label class="fl" for="sp-opt-a">${esc(pA)} Joint Optional (+/-)</label>
-            <input class="fi num" id="sp-opt-a" type="number" step="0.01" value="${Number(h.partner_a_joint_optional || 0)}" />
-          </div>
-          <div class="fg">
-            <label class="fl" for="sp-opt-b">${esc(pB)} Joint Optional (+/-)</label>
-            <input class="fi num" id="sp-opt-b" type="number" step="0.01" value="${Number(h.partner_b_joint_optional || 0)}" />
-          </div>
-        </div>
-        <div class="sheet-actions">
-          <button class="btn" id="sp-cancel" type="button">Cancel</button>
-          <button class="btn btn-primary" type="submit">Save Split</button>
-        </div>
-      </form>
-    `;
-
-    const toggleCustom = () => {
-      $('sp-custom-wrap').classList.toggle('hidden', $('sp-mode').value !== 'custom');
-    };
-    toggleCustom();
-    $('sp-mode').addEventListener('change', toggleCustom);
-    $('sp-cancel').addEventListener('click', closeModal);
-
-    $('split-modal-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const mode = $('sp-mode').value;
-      const pctA = Math.min(1, Math.max(0, Number($('sp-pct-a').value || 50) / 100));
-      closeModal();
-      await runMutation(
-        {
-          table: 'households',
-          action: 'update',
-          id: h.id,
-          payload: {
-            split_mode: mode,
-            partner_a_split: pctA,
-            partner_a_joint_optional: Number($('sp-opt-a').value || 0),
-            partner_b_joint_optional: Number($('sp-opt-b').value || 0),
-          },
-        },
-        'Updated cost split & optional adjustments'
-      );
-    });
-  });
-}
-
 function openHouseholdSettingsModal() {
   const h = state.household;
   openModal('Household Settings', (body) => {
@@ -2623,7 +2574,6 @@ function openJoinOtherModal() {
       if (error) return showToast(error.message);
       closeModal();
       state.selectedMonth = data.active_month || currentYearMonth();
-      state._personalPickedOnce = false;
       await loadProfileAndHousehold();
       showToast(`Joined ${data.name}`);
     });
@@ -2860,10 +2810,17 @@ function bindGlobalEvents() {
     await loadProfileAndHousehold();
   });
 
+  sb.auth.onAuthStateChange((_event, session) => {
+    if (session?.access_token) {
+      sb.realtime.setAuth(session.access_token);
+    }
+  });
+
   window.addEventListener('online', () => {
     state.online = true;
     updateSyncBar();
     flushOfflineQueue();
+    ensureRealtimeConnected();
     if (state.household) scheduleRefresh();
   });
 
@@ -2874,6 +2831,7 @@ function bindGlobalEvents() {
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && state.household && navigator.onLine) {
+      ensureRealtimeConnected();
       scheduleRefresh();
     }
   });
