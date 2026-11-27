@@ -172,6 +172,8 @@ function applyDarkMode() {
   document.body.classList.toggle('dark', state.darkMode);
   const btn = $('dark-toggle');
   if (btn) btn.textContent = state.darkMode ? '☀️' : '🌙';
+  const metaTheme = document.querySelector('meta[name="theme-color"]');
+  if (metaTheme) metaTheme.setAttribute('content', state.darkMode ? '#091210' : '#132a26');
 }
 
 function registerSW() {
