@@ -60,6 +60,17 @@ CREATE TABLE IF NOT EXISTS public.household_members (
     PRIMARY KEY (household_id, user_id)
 );
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'household_members_profile_fk'
+    ) THEN
+        ALTER TABLE public.household_members
+            ADD CONSTRAINT household_members_profile_fk
+            FOREIGN KEY (user_id) REFERENCES public.profiles(id) ON DELETE CASCADE;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS public.budget_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     household_id UUID NOT NULL REFERENCES public.households(id) ON DELETE CASCADE,

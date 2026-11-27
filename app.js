@@ -4,9 +4,9 @@ import {
   FREQUENCY_OPTIONS,
   computeBudgetModel,
   computeMonthlyAmount,
-} from './budget-engine.js?v=7';
+} from './budget-engine.js?v=8';
 
-const APP_VERSION = '1.7';
+const APP_VERSION = '1.8';
 
 const SUPABASE_URL = 'https://rpegjcnwtsjdbqrxxzrm.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_3QFbL-uHbTadq5eQpUdDiA_hTicgtOL';
@@ -321,7 +321,15 @@ async function loadProfileAndHousehold() {
 
 function getMyPartnerSlot() {
   const myMembership = state.members.find((m) => m.user_id === state.user?.id);
-  return myMembership?.partner_slot === 'b' ? 'b' : 'a';
+  if (myMembership?.partner_slot === 'b') return 'b';
+  if (myMembership?.partner_slot === 'a') return 'a';
+  if (state.items.some((i) => i.scope === 'partner_b') && !state.items.some((i) => i.scope === 'partner_a')) {
+    return 'b';
+  }
+  const myName = (state.profile?.display_name || '').trim().toLowerCase();
+  const pbName = (state.household?.partner_b_name || '').trim().toLowerCase();
+  if (myName && pbName && myName === pbName) return 'b';
+  return 'a';
 }
 
 function getMyPersonalScope() {
@@ -329,9 +337,10 @@ function getMyPersonalScope() {
 }
 
 async function fetchHouseholdData(householdId) {
-  const [hhRes, memRes, itemsRes, logsRes, snapRes] = await Promise.all([
+  const [hhRes, memRes, profsRes, itemsRes, logsRes, snapRes] = await Promise.all([
     sb.from('households').select('*').eq('id', householdId).single(),
-    sb.from('household_members').select('*, profiles(id, username, display_name, avatar_color)').eq('household_id', householdId),
+    sb.from('household_members').select('*').eq('household_id', householdId),
+    sb.from('profiles').select('id, username, display_name, avatar_color'),
     sb.from('budget_items').select('*').eq('household_id', householdId).order('sort_order', { ascending: true }).order('created_at', { ascending: true }),
     sb.from('spend_logs').select('*').eq('household_id', householdId).order('spend_date', { ascending: false }).order('created_at', { ascending: false }),
     sb.from('monthly_snapshots').select('*').eq('household_id', householdId).order('month_key', { ascending: true }),
@@ -343,8 +352,12 @@ async function fetchHouseholdData(householdId) {
     return;
   }
 
+  const profMap = Object.fromEntries((profsRes.data || []).map((p) => [p.id, p]));
   state.household = hhRes.data;
-  state.members = memRes.data || [];
+  state.members = (memRes.data || []).map((m) => ({
+    ...m,
+    profiles: profMap[m.user_id] || null,
+  }));
   state.items = itemsRes.data || [];
   state.spendLogs = logsRes.data || [];
   state.snapshots = snapRes.data || [];
