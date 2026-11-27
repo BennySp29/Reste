@@ -53,6 +53,13 @@ export const FREQUENCY_OPTIONS = [
   { value: 'weekly', label: 'Weekly', divisor: 12 / 52 },
 ];
 
+export function roundUpToNearest(amount, step = 50) {
+  const clean = Number(Number(amount || 0).toFixed(6));
+  if (clean <= 0) return 0;
+  if (!step || step <= 0) return clean;
+  return Math.ceil(clean / step) * step;
+}
+
 export function computeMonthlyAmount(rawCost, frequency) {
   const cost = Number(rawCost) || 0;
   switch (frequency) {
@@ -174,19 +181,20 @@ export function computeBudgetModel(household, items, spendLogs, activeMonth) {
 
   const jointExpenseSubtotal = regularTotal + budgetedTotal + prepaymentTotal;
 
-  // Joint Account Transfers & Joint Disposable
-  const transferA = Number(h.partner_a_joint_transfer || 0);
-  const transferB = Number(h.partner_b_joint_transfer || 0);
+  // Auto-calculated Joint Account Transfers (bills rounded up to nearest £50 + optional adjustment)
+  const roundStep = Number(h.transfer_round_to ?? 50);
+  const roundedBaseA = roundUpToNearest(jointBillsA, roundStep);
+  const roundedBaseB = roundUpToNearest(jointBillsB, roundStep);
+  const jointExtraA = roundedBaseA - jointBillsA;
+  const jointExtraB = roundedBaseB - jointBillsB;
+  const jointOptionalA = Number(h.partner_a_joint_optional || 0);
+  const jointOptionalB = Number(h.partner_b_joint_optional || 0);
+  const transferA = roundedBaseA + jointOptionalA;
+  const transferB = roundedBaseB + jointOptionalB;
   const jointAccountInflow = transferA + transferB + jointDirectIncome;
   const jointDisposable = jointAccountInflow - jointExpenseSubtotal;
 
-  // Joint Optional & Joint Extra
-  const jointOptionalA = Number(h.partner_a_joint_optional || 0);
-  const jointOptionalB = Number(h.partner_b_joint_optional || 0);
-  const jointExtraA = transferA - jointBillsA - jointOptionalA;
-  const jointExtraB = transferB - jointBillsB - jointOptionalB;
-
-  const computePartner = (scope, income, transfer, billsShare, jointExtra, jointOptional) => {
+  const computePartner = (scope, income, transfer, roundedBase, billsShare, jointExtra, jointOptional) => {
     const debts = list.filter((i) => i.scope === scope && i.section === 'debt');
     const bills = list.filter((i) => i.scope === scope && i.section === 'personal_bill');
     const savings = list.filter((i) => i.scope === scope && i.section === 'savings');
@@ -206,6 +214,7 @@ export function computeBudgetModel(household, items, spendLogs, activeMonth) {
     return {
       income,
       transfer,
+      roundedBase,
       billsShare,
       jointExtra,
       jointOptional,
@@ -225,8 +234,8 @@ export function computeBudgetModel(household, items, spendLogs, activeMonth) {
     };
   };
 
-  const partnerA = computePartner('partner_a', partnerAIncome, transferA, jointBillsA, jointExtraA, jointOptionalA);
-  const partnerB = computePartner('partner_b', partnerBIncome, transferB, jointBillsB, jointExtraB, jointOptionalB);
+  const partnerA = computePartner('partner_a', partnerAIncome, transferA, roundedBaseA, jointBillsA, jointExtraA, jointOptionalA);
+  const partnerB = computePartner('partner_b', partnerBIncome, transferB, roundedBaseB, jointBillsB, jointExtraB, jointOptionalB);
 
   const totalHouseholdExpenditure = jointExpenseSubtotal + partnerA.nonJointOutgoings + partnerB.nonJointOutgoings;
   const totalHouseholdDisposable = totalHouseholdIncome - totalHouseholdExpenditure;

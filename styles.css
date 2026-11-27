@@ -687,7 +687,7 @@ body.dark .badge.gold {
   font-weight: 600;
 }
 
-/* Split Bar & Waterfall */
+/* Split Bar, Slider & Waterfall */
 .split-bar {
   height: 10px;
   border-radius: 999px;
@@ -701,6 +701,216 @@ body.dark .badge.gold {
   background: var(--emerald);
   height: 100%;
   transition: width 0.25s ease;
+}
+
+.split-slider-wrap {
+  margin: 10px 0 8px;
+}
+
+.split-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+  background: linear-gradient(to right, var(--emerald) 0%, var(--emerald) 57%, var(--gold) 57%, var(--gold) 100%);
+}
+
+.split-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--brand);
+  border: 3px solid #faf7f0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+  cursor: grab;
+}
+
+.split-slider::-moz-range-thumb {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--brand);
+  border: 3px solid #faf7f0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+  cursor: grab;
+}
+
+.contrib-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.contrib-box {
+  background: var(--paper);
+  border: 1px solid var(--paper3);
+  border-radius: var(--rs);
+  padding: 10px 11px;
+}
+
+.contrib-hdr {
+  font-size: 12.5px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.contrib-line {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--ink2);
+  padding: 3px 0;
+}
+
+.contrib-line.total {
+  margin-top: 5px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--paper3);
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+/* Inline Click-to-Amend Pills */
+.val-pill {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1.5px solid var(--paper3);
+  border-radius: 8px;
+  padding: 4px 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.val-pill:hover,
+.val-pill:active {
+  border-color: var(--emerald);
+  background: var(--emerald-p);
+}
+
+.val-pill.credit {
+  color: var(--emerald);
+}
+
+.val-pill-sm {
+  font-size: 11.5px;
+  padding: 2px 7px;
+  border-radius: 7px;
+}
+
+.inline-edit-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.inline-num-input {
+  width: 88px;
+  padding: 4px 7px;
+  border-radius: 8px;
+  border: 2px solid var(--emerald);
+  background: var(--cream);
+  color: var(--ink);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13.5px;
+  font-weight: 600;
+  text-align: right;
+  outline: none;
+}
+
+.inline-sign-btn {
+  width: 26px;
+  height: 28px;
+  border-radius: 7px;
+  border: 1.5px solid var(--paper3);
+  background: var(--paper2);
+  color: var(--ink);
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.edit-gear-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  border: 1px solid var(--paper3);
+  background: var(--paper);
+  color: var(--ink3);
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.edit-gear-btn:active {
+  border-color: var(--emerald);
+  color: var(--emerald);
+}
+
+.summary-strip-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.mini-stat {
+  background: var(--paper);
+  border: 1px solid var(--paper3);
+  border-radius: var(--rs);
+  padding: 8px 9px;
+}
+
+.mini-stat-lbl {
+  font-size: 10.5px;
+  color: var(--ink3);
+}
+
+.mini-stat-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13.5px;
+  font-weight: 700;
+  margin-top: 2px;
+}
+
+.quick-add-box {
+  background: var(--paper);
+  border: 1.5px dashed var(--paper3);
+  border-radius: var(--rs);
+  padding: 10px;
+  margin-bottom: 12px;
+}
+
+.quick-add-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
 }
 
 .kv-grid {

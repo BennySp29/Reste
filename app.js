@@ -176,7 +176,7 @@ function applyDarkMode() {
 
 function registerSW() {
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
+    navigator.serviceWorker.register('./sw.js').catch(() => { });
   }
 }
 
@@ -398,6 +398,29 @@ async function broadcastChange(message) {
 }
 
 // ─── PERSISTENT CLOUD MUTATIONS + OFFLINE QUEUE ───────────────────────────────
+function applyOptimisticState(op) {
+  if (!op) return;
+  if (op.table === 'households' && state.household && op.id === state.household.id) {
+    state.household = { ...state.household, ...op.payload };
+  } else if (op.table === 'budget_items') {
+    if (op.action === 'update') {
+      state.items = state.items.map((it) => (it.id === op.id ? { ...it, ...op.payload } : it));
+    } else if (op.action === 'delete') {
+      state.items = state.items.filter((it) => it.id !== op.id);
+    } else if (op.action === 'insert') {
+      state.items = [...state.items, { id: `tmp_${Date.now()}`, ...op.payload }];
+    }
+  } else if (op.table === 'spend_logs') {
+    if (op.action === 'update') {
+      state.spendLogs = state.spendLogs.map((l) => (l.id === op.id ? { ...l, ...op.payload } : l));
+    } else if (op.action === 'delete') {
+      state.spendLogs = state.spendLogs.filter((l) => l.id !== op.id);
+    } else if (op.action === 'insert') {
+      state.spendLogs = [{ id: `tmp_${Date.now()}`, ...op.payload }, ...state.spendLogs];
+    }
+  }
+}
+
 async function runMutation(op, toastMsg) {
   const actorName = state.profile?.display_name || state.profile?.username || '';
   const executeOp = async (entry) => {
@@ -434,6 +457,9 @@ async function runMutation(op, toastMsg) {
     }
   };
 
+  applyOptimisticState(op);
+  renderAll();
+
   if (!navigator.onLine) {
     state.offlineQueue.push(op);
     saveOfflineQueue();
@@ -459,6 +485,8 @@ async function runMutation(op, toastMsg) {
       updateSyncBar();
       showToast('Connection lost — change queued safely');
     } else {
+      await fetchHouseholdData(state.household.id);
+      renderAll();
       showToast(`Save error: ${err?.message || 'Please retry'}`);
     }
   }
@@ -653,6 +681,8 @@ function getIncomeCategories() {
 
 function renderAll() {
   if (!state.household) return;
+  const mc = $('main-content');
+  const prevScroll = mc ? mc.scrollTop : 0;
   const activeMonth = state.selectedMonth || state.household.active_month || currentYearMonth();
   const model = computeBudgetModel(state.household, state.items, state.spendLogs, activeMonth);
 
@@ -661,6 +691,270 @@ function renderAll() {
   else if (state.activeTab === 'spend') renderSpend(model, activeMonth);
   else if (state.activeTab === 'personal') renderPersonal(model);
   else if (state.activeTab === 'household') renderHouseholdTab(model);
+
+  if (mc) mc.scrollTop = prevScroll;
+}
+
+// ─── UNIVERSAL INLINE CLICK-TO-AMEND & SPLIT SLIDER ───────────────────────────
+function valPillHtml({ kind, id = '', val = 0, label = '', allowNeg = false, small = false, credit = false }) {
+  const numVal = Number(val || 0);
+  const display = label || fmtMoney(numVal);
+  const cls = `val-pill num${small ? ' val-pill-sm' : ''}${credit || numVal < 0 ? ' credit' : ''}`;
+  return `<button type="button" class="${cls}" data-inline-edit="${esc(kind)}" data-id="${esc(id)}" data-val="${numVal}" data-allow-neg="${allowNeg ? '1' : '0'}" title="Tap to amend value">${esc(display)}</button>`;
+}
+
+function attachInlineEditors(rootEl) {
+  if (!rootEl) return;
+  rootEl.querySelectorAll('[data-inline-edit]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (btn.dataset.editing === '1') return;
+      btn.dataset.editing = '1';
+
+      const kind = btn.dataset.inlineEdit;
+      const id = btn.dataset.id;
+      const origVal = Number(btn.dataset.val || 0);
+      const allowNeg = btn.dataset.allowNeg === '1';
+
+      const wrap = document.createElement('span');
+      wrap.className = 'inline-edit-wrap';
+      wrap.addEventListener('click', (ev) => ev.stopPropagation());
+
+      if (allowNeg) {
+        const signBtn = document.createElement('button');
+        signBtn.type = 'button';
+        signBtn.className = 'inline-sign-btn';
+        signBtn.textContent = '±';
+        signBtn.title = 'Toggle +/- sign';
+        signBtn.addEventListener('pointerdown', (ev) => ev.preventDefault());
+        signBtn.addEventListener('mousedown', (ev) => ev.preventDefault());
+        signBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          const cur = Number(input.value || 0);
+          input.value = String(-cur);
+          input.focus();
+          input.select();
+        });
+        wrap.appendChild(signBtn);
+      }
+
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = '0.01';
+      input.className = 'inline-num-input';
+      input.value = String(origVal);
+      wrap.appendChild(input);
+
+      btn.replaceWith(wrap);
+      input.focus();
+      input.select();
+
+      let done = false;
+      const cancel = () => {
+        if (done) return;
+        done = true;
+        renderAll();
+      };
+
+      const commit = async () => {
+        if (done) return;
+        done = true;
+        const raw = input.value.trim();
+        const nextVal = raw === '' ? 0 : Number(raw);
+        if (Number.isNaN(nextVal) || Math.abs(nextVal - origVal) < 0.0001) {
+          renderAll();
+          return;
+        }
+        await commitInlineValue(kind, id, nextVal);
+      };
+
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          commit();
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          cancel();
+        }
+      });
+      input.addEventListener('blur', () => {
+        setTimeout(() => commit(), 20);
+      });
+    });
+  });
+}
+
+async function commitInlineValue(kind, id, nextVal) {
+  const h = state.household;
+  if (!h) return;
+
+  if (kind === 'hh-opt-a') {
+    await runMutation(
+      { table: 'households', action: 'update', id: h.id, payload: { partner_a_joint_optional: nextVal } },
+      `Updated ${h.partner_a_name} optional to ${fmtMoney(nextVal)}`
+    );
+    return;
+  }
+  if (kind === 'hh-opt-b') {
+    await runMutation(
+      { table: 'households', action: 'update', id: h.id, payload: { partner_b_joint_optional: nextVal } },
+      `Updated ${h.partner_b_name} optional to ${fmtMoney(nextVal)}`
+    );
+    return;
+  }
+  if (kind === 'spend-amount') {
+    const log = state.spendLogs.find((l) => l.id === id);
+    await runMutation(
+      { table: 'spend_logs', action: 'update', id, payload: { amount: nextVal } },
+      `Updated ${log?.pot_name || 'receipt'} to ${fmtMoney(nextVal)}`
+    );
+    return;
+  }
+
+  const item = state.items.find((i) => i.id === id);
+  if (!item) return;
+
+  if (kind === 'item-amount') {
+    await runMutation(
+      { table: 'budget_items', action: 'update', id, payload: { amount: nextVal } },
+      `${item.name}: ${fmtMoney(nextVal)}`
+    );
+  } else if (kind === 'item-actual') {
+    await runMutation(
+      { table: 'budget_items', action: 'update', id, payload: { actual_amount: nextVal } },
+      `${item.name} actual: ${fmtMoney(nextVal)}`
+    );
+  } else if (kind === 'item-pa') {
+    await runMutation(
+      { table: 'budget_items', action: 'update', id, payload: { partner_a_amount: nextVal } },
+      `${item.name} (${h.partner_a_name}): ${fmtMoney(nextVal)}`
+    );
+  } else if (kind === 'item-pb') {
+    await runMutation(
+      { table: 'budget_items', action: 'update', id, payload: { partner_b_amount: nextVal } },
+      `${item.name} (${h.partner_b_name}): ${fmtMoney(nextVal)}`
+    );
+  } else if (kind === 'item-prepay-raw') {
+    const monthly = Number(computeMonthlyAmount(nextVal, item.frequency || 'monthly').toFixed(2));
+    await runMutation(
+      { table: 'budget_items', action: 'update', id, payload: { raw_cost: nextVal, amount: monthly } },
+      `${item.name}: ${fmtMoney(nextVal)} (${fmtMoney(monthly)}/mo)`
+    );
+  }
+}
+
+function renderSplitSliderCard(m, compact = false) {
+  const h = state.household;
+  const pA = h.partner_a_name || 'Partner 1';
+  const pB = h.partner_b_name || 'Partner 2';
+  const pctNum = Math.round(m.split.activeA * 100);
+
+  return `
+    <div class="card">
+      <div class="sec-hdr">
+        <div>
+          <div class="sec-title">Bill Split &amp; Auto Joint Transfers</div>
+          <div class="sec-sub">Suggested by income: ${fmtPct(m.split.suggestedA)} / ${fmtPct(m.split.suggestedB)} · Rounds up to nearest £50</div>
+        </div>
+        <button class="btn btn-sm" id="split-preset-sug" type="button" style="${h.split_mode === 'suggested' ? 'border-color:var(--emerald);background:var(--emerald-p);color:var(--emerald);' : ''}">Use Suggested</button>
+      </div>
+
+      <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:13px;font-weight:700;">
+        <span style="color:var(--emerald);">${esc(pA)}: <span class="num" data-live-split-a>${fmtPct(m.split.activeA)}</span> (<span class="num" data-live-bills-a>${fmtMoney(m.jointBillsA)}</span>)</span>
+        <span style="color:var(--gold);">${esc(pB)}: <span class="num" data-live-split-b>${fmtPct(m.split.activeB)}</span> (<span class="num" data-live-bills-b>${fmtMoney(m.jointBillsB)}</span>)</span>
+      </div>
+
+      <div class="split-slider-wrap">
+        <input type="range" min="0" max="100" step="1" value="${pctNum}" class="split-slider" id="bill-split-slider"
+          style="background:linear-gradient(to right, var(--emerald) 0%, var(--emerald) ${(m.split.activeA * 100).toFixed(1)}%, var(--gold) ${(m.split.activeA * 100).toFixed(1)}%, var(--gold) 100%);"
+          aria-label="Percentage split slider" />
+      </div>
+
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:4px;">
+        <button class="chip ${h.split_mode === 'equal' ? 'on' : ''}" id="split-preset-eq" type="button">50 / 50 Equal</button>
+        <button class="chip ${h.split_mode === 'suggested' ? 'on' : ''}" id="split-preset-sug-chip" type="button">Income Match (${fmtPct(m.split.suggestedA)})</button>
+      </div>
+
+      ${compact
+      ? `<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--ink2);margin-top:8px;padding-top:8px;border-top:1px dashed var(--paper3);">
+            <span>${esc(pA)} Transfer: <strong class="num" data-live-transfer-a>${fmtMoney(m.transferA)}</strong></span>
+            <span>${esc(pB)} Transfer: <strong class="num" data-live-transfer-b>${fmtMoney(m.transferB)}</strong></span>
+          </div>`
+      : `<div class="contrib-grid">
+            <div class="contrib-box">
+              <div class="contrib-hdr"><span>${esc(pA)}</span><span class="badge emerald">Auto £50</span></div>
+              <div class="contrib-line"><span>Bills share</span><span class="num" data-live-bills-a-box>${fmtMoney(m.jointBillsA)}</span></div>
+              <div class="contrib-line"><span>Round-up extra</span><span class="num" data-live-extra-a>${fmtMoney(m.partnerA.jointExtra)}</span></div>
+              <div class="contrib-line"><span>Optional (+/-)</span>${valPillHtml({ kind: 'hh-opt-a', val: m.partnerA.jointOptional, allowNeg: true, small: true })}</div>
+              <div class="contrib-line total"><span>Joint Transfer</span><span class="num" data-live-transfer-a>${fmtMoney(m.transferA)}</span></div>
+            </div>
+            <div class="contrib-box">
+              <div class="contrib-hdr"><span>${esc(pB)}</span><span class="badge gold">Auto £50</span></div>
+              <div class="contrib-line"><span>Bills share</span><span class="num" data-live-bills-b-box>${fmtMoney(m.jointBillsB)}</span></div>
+              <div class="contrib-line"><span>Round-up extra</span><span class="num" data-live-extra-b>${fmtMoney(m.partnerB.jointExtra)}</span></div>
+              <div class="contrib-line"><span>Optional (+/-)</span>${valPillHtml({ kind: 'hh-opt-b', val: m.partnerB.jointOptional, allowNeg: true, small: true })}</div>
+              <div class="contrib-line total"><span>Joint Transfer</span><span class="num" data-live-transfer-b>${fmtMoney(m.transferB)}</span></div>
+            </div>
+          </div>`
+    }
+    </div>
+  `;
+}
+
+function bindSplitSlider(rootEl) {
+  if (!rootEl) return;
+  const slider = rootEl.querySelector('#bill-split-slider');
+  const h = state.household;
+  if (!h) return;
+
+  const updateLiveDom = () => {
+    const activeMonth = state.selectedMonth || h.active_month || currentYearMonth();
+    const live = computeBudgetModel(h, state.items, state.spendLogs, activeMonth);
+    const pctStr = (live.split.activeA * 100).toFixed(1);
+    if (slider) {
+      slider.style.background = `linear-gradient(to right, var(--emerald) 0%, var(--emerald) ${pctStr}%, var(--gold) ${pctStr}%, var(--gold) 100%)`;
+    }
+    const setAll = (sel, txt) => document.querySelectorAll(sel).forEach((el) => (el.textContent = txt));
+    setAll('[data-live-split-a]', fmtPct(live.split.activeA));
+    setAll('[data-live-split-b]', fmtPct(live.split.activeB));
+    setAll('[data-live-bills-a], [data-live-bills-a-box]', fmtMoney(live.jointBillsA));
+    setAll('[data-live-bills-b], [data-live-bills-b-box]', fmtMoney(live.jointBillsB));
+    setAll('[data-live-extra-a]', fmtMoney(live.partnerA.jointExtra));
+    setAll('[data-live-extra-b]', fmtMoney(live.partnerB.jointExtra));
+    setAll('[data-live-transfer-a]', fmtMoney(live.transferA));
+    setAll('[data-live-transfer-b]', fmtMoney(live.transferB));
+    setAll('[data-live-joint-reste]', fmtMoney(live.jointDisposable));
+    setAll('[data-live-pa-reste]', fmtMoney(live.partnerA.disposable));
+    setAll('[data-live-pb-reste]', fmtMoney(live.partnerB.disposable));
+    setAll('[data-live-total-reste]', fmtMoney(live.totalHouseholdDisposable));
+  };
+
+  slider?.addEventListener('input', (e) => {
+    const val = Math.min(100, Math.max(0, Number(e.target.value || 50)));
+    h.split_mode = 'custom';
+    h.partner_a_split = val / 100;
+    updateLiveDom();
+  });
+
+  slider?.addEventListener('change', async (e) => {
+    const val = Math.min(100, Math.max(0, Number(e.target.value || 50)));
+    const nextSplit = val / 100;
+    await runMutation(
+      { table: 'households', action: 'update', id: h.id, payload: { split_mode: 'custom', partner_a_split: nextSplit } },
+      `Split updated to ${val}% / ${100 - val}%`
+    );
+  });
+
+  const applyPreset = async (mode) => {
+    await runMutation(
+      { table: 'households', action: 'update', id: h.id, payload: { split_mode: mode } },
+      mode === 'equal' ? 'Split set to 50% / 50%' : 'Split matched to income'
+    );
+  };
+
+  rootEl.querySelector('#split-preset-eq')?.addEventListener('click', () => applyPreset('equal'));
+  rootEl.querySelector('#split-preset-sug')?.addEventListener('click', () => applyPreset('suggested'));
+  rootEl.querySelector('#split-preset-sug-chip')?.addEventListener('click', () => applyPreset('suggested'));
 }
 
 function renderOverview(m, activeMonth) {
@@ -671,17 +965,21 @@ function renderOverview(m, activeMonth) {
 
   const potHtml = m.potTrackers.length
     ? m.potTrackers
-        .map((p) => {
-          const barCls = p.over ? 'over' : p.pct >= 80 ? 'warn' : '';
-          const remTxt =
-            p.remaining >= 0
-              ? `${fmtMoney(p.remaining)} left`
-              : `<span class="over-txt">${fmtMoney(Math.abs(p.remaining))} over</span>`;
-          return `
-          <div class="pot-row" data-log-pot="${esc(p.name)}" style="cursor:pointer;">
+      .map((p) => {
+        const barCls = p.over ? 'over' : p.pct >= 80 ? 'warn' : '';
+        const remTxt =
+          p.remaining >= 0
+            ? `${fmtMoney(p.remaining)} left`
+            : `<span class="over-txt">${fmtMoney(Math.abs(p.remaining))} over</span>`;
+        return `
+          <div class="pot-row">
             <div class="pot-top">
               <span class="pot-name">${esc(p.name)}</span>
-              <span class="pot-nums num">${fmtMoney(p.actual)} / ${fmtMoney(p.budget)}</span>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span class="pot-nums num">${fmtMoney(p.actual)} /</span>
+                ${valPillHtml({ kind: 'item-amount', id: p.id, val: p.budget, small: true })}
+                <button class="btn btn-sm" data-log-pot="${esc(p.name)}" type="button" style="padding:3px 8px;font-size:11px;">+ Spend</button>
+              </div>
             </div>
             <div class="bar-track"><div class="bar-fill ${barCls}" style="width:${p.pct.toFixed(1)}%"></div></div>
             <div class="pot-foot">
@@ -689,16 +987,16 @@ function renderOverview(m, activeMonth) {
               <span>${remTxt}</span>
             </div>
           </div>`;
-        })
-        .join('')
+      })
+      .join('')
     : '<div class="empty-note">No budgeted pots yet. Add one in the Joint tab.</div>';
 
   const maxCat = m.categoriesSorted[0]?.total || 1;
   const catHtml = m.categoriesSorted.length
     ? m.categoriesSorted
-        .map((c) => {
-          const w = Math.min(100, (c.total / maxCat) * 100);
-          return `
+      .map((c) => {
+        const w = Math.min(100, (c.total / maxCat) * 100);
+        return `
           <div style="margin-bottom:9px;">
             <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px;">
               <span>${esc(c.name)}</span>
@@ -706,8 +1004,8 @@ function renderOverview(m, activeMonth) {
             </div>
             <div class="bar-track" style="height:6px;"><div class="bar-fill" style="width:${w.toFixed(1)}%"></div></div>
           </div>`;
-        })
-        .join('')
+      })
+      .join('')
     : '<div class="empty-note">Add joint expenses to see category totals.</div>';
 
   $('panel-overview').innerHTML = `
@@ -715,74 +1013,42 @@ function renderOverview(m, activeMonth) {
       <div class="hero-top">
         <div>
           <div class="hero-kicker">Monthly Household Reste</div>
-          <div class="hero-amount ${m.totalHouseholdDisposable < 0 ? 'neg' : ''}">${fmtMoney(m.totalHouseholdDisposable)}</div>
+          <div class="hero-amount ${m.totalHouseholdDisposable < 0 ? 'neg' : ''}" data-live-total-reste>${fmtMoney(m.totalHouseholdDisposable)}</div>
         </div>
         <button class="btn btn-sm" id="ov-log-spend-btn" style="background:rgba(255,255,255,0.14);border-color:rgba(255,255,255,0.22);color:#faf7f0;">+ Log Spend</button>
       </div>
       <div class="hero-meta-row">
         <span>Income <strong class="num">${fmtMoney(m.totalHouseholdIncome)}</strong></span>
         <span>Expenses <strong class="num">${fmtMoney(totalOutNeg)}</strong></span>
+        <span>Joint Out <strong class="num">${fmtMoney(m.jointExpenseSubtotal)}</strong></span>
       </div>
       <div class="hero-pills">
         <button class="hero-pill" data-jump-tab="joint" type="button">
           <span class="hero-pill-lbl">Joint Reste</span>
-          <span class="hero-pill-val">${fmtMoney(m.jointDisposable)}</span>
+          <span class="hero-pill-val" data-live-joint-reste>${fmtMoney(m.jointDisposable)}</span>
         </button>
         <button class="hero-pill" data-jump-personal="partner_a" type="button">
           <span class="hero-pill-lbl">${esc(pA)}'s Reste</span>
-          <span class="hero-pill-val">${fmtMoney(m.partnerA.disposable)}</span>
+          <span class="hero-pill-val" data-live-pa-reste>${fmtMoney(m.partnerA.disposable)}</span>
         </button>
         <button class="hero-pill" data-jump-personal="partner_b" type="button">
           <span class="hero-pill-lbl">${esc(pB)}'s Reste</span>
-          <span class="hero-pill-val">${fmtMoney(m.partnerB.disposable)}</span>
+          <span class="hero-pill-val" data-live-pb-reste>${fmtMoney(m.partnerB.disposable)}</span>
         </button>
       </div>
     </div>
+
+    ${renderSplitSliderCard(m, false)}
 
     <div class="card">
       <div class="sec-hdr">
         <div>
           <div class="sec-title">Budgeted Pots · ${esc(fmtMonthLabel(activeMonth))}</div>
-          <div class="sec-sub">Tap any pot to log a receipt</div>
+          <div class="sec-sub">Tap a pot's limit to amend it, or + Spend to log</div>
         </div>
         <button class="btn btn-sm" id="ov-open-spend-btn" type="button">All Spend →</button>
       </div>
       ${potHtml}
-    </div>
-
-    <div class="card">
-      <div class="sec-hdr">
-        <div>
-          <div class="sec-title">Cost Split &amp; Joint Transfers</div>
-          <div class="sec-sub">Suggested by income: ${fmtPct(m.split.suggestedA)} / ${fmtPct(m.split.suggestedB)}</div>
-        </div>
-        <button class="btn btn-sm" id="ov-edit-split-btn" type="button">Edit Split</button>
-      </div>
-      <div class="split-bar">
-        <div class="split-bar-a" style="width:${(m.split.activeA * 100).toFixed(1)}%"></div>
-      </div>
-      <div style="display:flex;justify-content:space-between;font-size:12.5px;font-weight:600;">
-        <span>${esc(pA)}: ${fmtPct(m.split.activeA)} (${fmtMoney(m.jointBillsA)} bills)</span>
-        <span>${esc(pB)}: ${fmtPct(m.split.activeB)} (${fmtMoney(m.jointBillsB)} bills)</span>
-      </div>
-      <div class="kv-grid">
-        <div class="kv-box">
-          <div class="kv-lbl">${esc(pA)} Joint Transfer</div>
-          <div class="kv-val">${fmtMoney(m.transferA)}</div>
-        </div>
-        <div class="kv-box">
-          <div class="kv-lbl">${esc(pB)} Joint Transfer</div>
-          <div class="kv-val">${fmtMoney(m.transferB)}</div>
-        </div>
-        <div class="kv-box">
-          <div class="kv-lbl">Joint Direct Income</div>
-          <div class="kv-val">${fmtMoney(m.jointDirectIncome)}</div>
-        </div>
-        <div class="kv-box">
-          <div class="kv-lbl">Joint Outgoings</div>
-          <div class="kv-val">${fmtMoney(m.jointExpenseSubtotal)}</div>
-        </div>
-      </div>
     </div>
 
     <div class="card">
@@ -798,7 +1064,6 @@ function renderOverview(m, activeMonth) {
 
   $('ov-log-spend-btn')?.addEventListener('click', () => openSpendModal());
   $('ov-open-spend-btn')?.addEventListener('click', () => setActiveTab('spend'));
-  $('ov-edit-split-btn')?.addEventListener('click', () => openSplitTransfersModal(m));
   $('panel-overview').querySelectorAll('[data-jump-tab]').forEach((b) =>
     b.addEventListener('click', () => setActiveTab(b.dataset.jumpTab))
   );
@@ -808,9 +1073,14 @@ function renderOverview(m, activeMonth) {
       setActiveTab('personal');
     })
   );
-  $('panel-overview').querySelectorAll('[data-log-pot]').forEach((row) =>
-    row.addEventListener('click', () => openSpendModal(null, row.dataset.logPot))
+  $('panel-overview').querySelectorAll('[data-log-pot]').forEach((btn) =>
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openSpendModal(null, btn.dataset.logPot);
+    })
   );
+  bindSplitSlider($('panel-overview'));
+  attachInlineEditors($('panel-overview'));
 }
 
 function renderJoint(m) {
@@ -848,23 +1118,29 @@ function renderJoint(m) {
           ? FREQUENCY_OPTIONS.find((f) => f.value === item.frequency)?.label || item.frequency
           : '';
         return `
-        <div class="item-row" data-edit-item="${item.id}">
+        <div class="item-row" style="cursor:default;">
           <div class="item-chk ${item.is_paid ? 'on' : ''}" data-toggle-paid="${item.id}" title="Mark paid">✓</div>
           <div class="item-main">
             <div class="item-name">
               <span>${esc(item.name)}</span>
               <span class="badge">${esc(item.category)}</span>
-              ${isPrepayment ? `<span class="badge gold">${fmtMoney(item.raw_cost ?? item.amount)} · ${esc(freqLbl)}</span>` : ''}
+              ${isPrepayment ? `<span class="badge gold">${esc(freqLbl)}</span>` : ''}
             </div>
             <div class="item-sub">
               <span>${esc(pA)}: ${fmtMoney(shareA)}</span>
               <span>${esc(pB)}: ${fmtMoney(shareB)}</span>
+              ${isPrepayment ? `<span>Bill:</span> ${valPillHtml({ kind: 'item-prepay-raw', id: item.id, val: item.raw_cost ?? item.amount, small: true })}` : ''}
               ${item.paid_by ? `<span>Paid by ${esc(item.paid_by)}</span>` : ''}
             </div>
           </div>
-          <div class="item-right">
-            <div class="item-amt">${fmtMoney(monthly)}</div>
-            <div class="item-split">${isPrepayment ? '/ month' : fmtPct(sA)}</div>
+          <div class="item-right" style="display:flex;align-items:center;gap:6px;">
+            <div>
+              ${isPrepayment
+          ? `<div class="item-amt">${fmtMoney(monthly)}</div><div class="item-split">/ month</div>`
+          : `${valPillHtml({ kind: 'item-amount', id: item.id, val: monthly })}<div class="item-split">${fmtPct(sA)}</div>`
+        }
+            </div>
+            <button type="button" class="edit-gear-btn" data-edit-item="${item.id}" title="Edit item details">✎</button>
           </div>
         </div>`;
       })
@@ -873,54 +1149,58 @@ function renderJoint(m) {
 
   const incomeHtml = m.incomeItems.length
     ? m.incomeItems
-        .map((item) => {
-          const rowTotal = Number(item.amount || 0) + Number(item.partner_a_amount || 0) + Number(item.partner_b_amount || 0);
-          return `
-          <div class="item-row" data-edit-item="${item.id}">
+      .map((item) => {
+        const rowTotal = Number(item.amount || 0) + Number(item.partner_a_amount || 0) + Number(item.partner_b_amount || 0);
+        return `
+          <div class="item-row" style="cursor:default;">
             <div class="item-main">
               <div class="item-name">
                 <span>${esc(item.name)}</span>
                 <span class="badge emerald">${esc(item.category)}</span>
               </div>
-              <div class="item-sub">
-                ${Number(item.amount) ? `<span>Joint: ${fmtMoney(item.amount)}</span>` : ''}
-                ${Number(item.partner_a_amount) ? `<span>${esc(pA)}: ${fmtMoney(item.partner_a_amount)}</span>` : ''}
-                ${Number(item.partner_b_amount) ? `<span>${esc(pB)}: ${fmtMoney(item.partner_b_amount)}</span>` : ''}
+              <div class="item-sub" style="align-items:center;margin-top:4px;">
+                <span>Joint</span> ${valPillHtml({ kind: 'item-amount', id: item.id, val: item.amount || 0, small: true })}
+                <span>${esc(pA)}</span> ${valPillHtml({ kind: 'item-pa', id: item.id, val: item.partner_a_amount || 0, small: true })}
+                <span>${esc(pB)}</span> ${valPillHtml({ kind: 'item-pb', id: item.id, val: item.partner_b_amount || 0, small: true })}
               </div>
             </div>
-            <div class="item-right">
+            <div class="item-right" style="display:flex;align-items:center;gap:6px;">
               <div class="item-amt credit">${fmtMoney(rowTotal)}</div>
+              <button type="button" class="edit-gear-btn" data-edit-item="${item.id}" title="Edit income details">✎</button>
             </div>
           </div>`;
-        })
-        .join('')
+      })
+      .join('')
     : '<div class="empty-note">No income rows added yet.</div>';
 
   const debtTrackerHtml = m.jointDebtItems.length
     ? m.jointDebtItems
-        .map(
-          (d) => `
-        <div class="item-row" data-edit-item="${d.id}">
+      .map(
+        (d) => `
+        <div class="item-row" style="cursor:default;">
           <div class="item-main">
             <div class="item-name">${esc(d.name)}</div>
-            <div class="item-sub">Expected ${fmtMoney(d.amount)} · Actual ${fmtMoney(d.actual_amount || 0)}</div>
+            <div class="item-sub" style="align-items:center;margin-top:4px;">
+              <span>Expected</span> ${valPillHtml({ kind: 'item-amount', id: d.id, val: d.amount || 0, small: true })}
+              <span>Actual</span> ${valPillHtml({ kind: 'item-actual', id: d.id, val: d.actual_amount ?? 0, small: true })}
+            </div>
           </div>
-          <div class="item-right">
-            <div class="item-amt">${fmtMoney(d.actual_amount ?? d.amount)}</div>
-          </div>
+          <button type="button" class="edit-gear-btn" data-edit-item="${d.id}" title="Edit details">✎</button>
         </div>`
-        )
-        .join('')
+      )
+      .join('')
     : '';
 
   $('panel-joint').innerHTML = `
+    ${renderSplitSliderCard(m, true)}
+
     <div class="fg" style="margin-bottom:10px;">
       <input class="fi" id="joint-search-input" type="search" placeholder="Search bills, income, pots…" value="${esc(state.jointSearch)}" />
     </div>
     <div class="chip-strip">
       ${[...usedCats]
-        .map((c) => `<button class="chip ${state.jointFilterCat === c ? 'on' : ''}" data-cat-chip="${esc(c)}" type="button">${esc(c)}</button>`)
-        .join('')}
+      .map((c) => `<button class="chip ${state.jointFilterCat === c ? 'on' : ''}" data-cat-chip="${esc(c)}" type="button">${esc(c)}</button>`)
+      .join('')}
     </div>
 
     <div class="card">
@@ -983,9 +1263,8 @@ function renderJoint(m) {
       </div>
     </div>
 
-    ${
-      debtTrackerHtml
-        ? `<div class="card">
+    ${debtTrackerHtml
+      ? `<div class="card">
             <div class="sec-hdr">
               <div>
                 <div class="sec-title">Joint Debt Repayment</div>
@@ -998,7 +1277,7 @@ function renderJoint(m) {
               <span class="num">Actual ${fmtMoney(m.jointDebtActual)}</span>
             </div>
           </div>`
-        : ''
+      : ''
     }
 
     <div class="card" style="background:var(--emerald-p);border-color:var(--emerald);">
@@ -1007,8 +1286,8 @@ function renderJoint(m) {
         <span class="num">${fmtMoney(m.jointExpenseSubtotal)}</span>
       </div>
       <div style="display:flex;justify-content:space-between;font-size:12.5px;color:var(--ink2);margin-top:6px;">
-        <span>${esc(pA)}'s share (${fmtPct(m.split.activeA)}): <strong class="num">${fmtMoney(m.jointBillsA)}</strong></span>
-        <span>${esc(pB)}'s share (${fmtPct(m.split.activeB)}): <strong class="num">${fmtMoney(m.jointBillsB)}</strong></span>
+        <span>${esc(pA)}'s share (<span data-live-split-a>${fmtPct(m.split.activeA)}</span>): <strong class="num" data-live-bills-a>${fmtMoney(m.jointBillsA)}</strong></span>
+        <span>${esc(pB)}'s share (<span data-live-split-b>${fmtPct(m.split.activeB)}</span>): <strong class="num" data-live-bills-b>${fmtMoney(m.jointBillsB)}</strong></span>
       </div>
     </div>
   `;
@@ -1028,7 +1307,9 @@ function renderJoint(m) {
       renderJoint(m);
     })
   );
+  bindSplitSlider($('panel-joint'));
   bindItemActions('panel-joint');
+  attachInlineEditors($('panel-joint'));
 }
 
 function renderSpend(m, activeMonth) {
@@ -1089,11 +1370,11 @@ function renderSpend(m, activeMonth) {
       </div>
       <div class="chip-strip" style="margin-bottom:0;padding-bottom:2px;">
         ${months
-          .map(
-            (mk) =>
-              `<button class="chip ${mk === activeMonth ? 'on' : ''}" data-pick-month="${esc(mk)}" type="button">${esc(fmtMonthLabel(mk))}</button>`
-          )
-          .join('')}
+      .map(
+        (mk) =>
+          `<button class="chip ${mk === activeMonth ? 'on' : ''}" data-pick-month="${esc(mk)}" type="button">${esc(fmtMonthLabel(mk))}</button>`
+      )
+      .join('')}
       </div>
     </div>
 
@@ -1104,13 +1385,13 @@ function renderSpend(m, activeMonth) {
       <form id="inline-spend-form">
         <div class="chip-strip" style="margin-bottom:10px;">
           ${pots.length
-            ? pots
-                .map(
-                  (p) =>
-                    `<button class="chip ${state.selectedLogPot === p.name ? 'on' : ''}" data-select-pot="${esc(p.name)}" type="button">${esc(p.name)}</button>`
-                )
-                .join('')
-            : '<span class="sec-sub">Add a budgeted pot in Joint first</span>'}
+      ? pots
+        .map(
+          (p) =>
+            `<button class="chip ${state.selectedLogPot === p.name ? 'on' : ''}" data-select-pot="${esc(p.name)}" type="button">${esc(p.name)}</button>`
+        )
+        .join('')
+      : '<span class="sec-sub">Add a budgeted pot in Joint first</span>'}
         </div>
         <div class="frow">
           <div class="fg">
@@ -1135,9 +1416,9 @@ function renderSpend(m, activeMonth) {
         <div class="sec-title">Pot Balances</div>
       </div>
       ${m.potTrackers
-        .map((p) => {
-          const barCls = p.over ? 'over' : p.pct >= 80 ? 'warn' : '';
-          return `
+      .map((p) => {
+        const barCls = p.over ? 'over' : p.pct >= 80 ? 'warn' : '';
+        return `
           <div class="pot-row">
             <div class="pot-top">
               <span class="pot-name">${esc(p.name)}</span>
@@ -1149,8 +1430,8 @@ function renderSpend(m, activeMonth) {
               <span>${p.remaining >= 0 ? `${fmtMoney(p.remaining)} left` : `<span class="over-txt">${fmtMoney(Math.abs(p.remaining))} over</span>`}</span>
             </div>
           </div>`;
-        })
-        .join('') || '<div class="empty-note">No pots configured.</div>'}
+      })
+      .join('') || '<div class="empty-note">No pots configured.</div>'}
     </div>
 
     <div class="card">
@@ -1162,10 +1443,10 @@ function renderSpend(m, activeMonth) {
       </div>
       <div class="item-list">
         ${m.monthLogs.length
-          ? m.monthLogs
-              .map(
-                (l) => `
-              <div class="item-row" data-edit-log="${l.id}">
+      ? m.monthLogs
+        .map(
+          (l) => `
+              <div class="item-row" style="cursor:default;">
                 <div class="item-main">
                   <div class="item-name">
                     <span>${esc(l.pot_name)}</span>
@@ -1176,13 +1457,14 @@ function renderSpend(m, activeMonth) {
                     ${l.created_by_name ? `<span>· ${esc(l.created_by_name)}</span>` : ''}
                   </div>
                 </div>
-                <div class="item-right">
-                  <div class="item-amt">${fmtMoney(l.amount)}</div>
+                <div class="item-right" style="display:flex;align-items:center;gap:6px;">
+                  ${valPillHtml({ kind: 'spend-amount', id: l.id, val: l.amount })}
+                  <button type="button" class="edit-gear-btn" data-edit-log="${l.id}" title="Edit receipt details">✎</button>
                 </div>
               </div>`
-              )
-              .join('')
-          : '<div class="empty-note">No receipts logged in this month yet.</div>'}
+        )
+        .join('')
+      : '<div class="empty-note">No receipts logged in this month yet.</div>'}
       </div>
     </div>
 
@@ -1201,12 +1483,11 @@ function renderSpend(m, activeMonth) {
           </thead>
           <tbody>
             ${histBody || '<tr><td colspan="4" class="empty-note">No monthly snapshots yet.</td></tr>'}
-            ${
-              historyRows.length
-                ? `<tr><td><strong>Total</strong></td>${totalCells}</tr>
+            ${historyRows.length
+      ? `<tr><td><strong>Total</strong></td>${totalCells}</tr>
                    <tr><td><strong>Average</strong></td>${avgCells}</tr>`
-                : ''
-            }
+      : ''
+    }
           </tbody>
         </table>
       </div>
@@ -1260,12 +1541,14 @@ function renderSpend(m, activeMonth) {
     );
   });
 
-  $('panel-spend').querySelectorAll('[data-edit-log]').forEach((row) =>
-    row.addEventListener('click', () => {
-      const log = state.spendLogs.find((l) => l.id === row.dataset.editLog);
+  $('panel-spend').querySelectorAll('[data-edit-log]').forEach((btn) =>
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const log = state.spendLogs.find((l) => l.id === btn.dataset.editLog);
       if (log) openSpendModal(log);
     })
   );
+  attachInlineEditors($('panel-spend'));
 
   $('save-snapshot-btn')?.addEventListener('click', async () => {
     const potTotals = {};
@@ -1295,16 +1578,24 @@ function renderSpend(m, activeMonth) {
 
 function renderPersonal(m) {
   const h = state.household;
-  const pAName = h.partner_a_name || 'Partner A';
-  const pBName = h.partner_b_name || 'Partner B';
+  const pAName = h.partner_a_name || 'Partner 1';
+  const pBName = h.partner_b_name || 'Partner 2';
   const scope = state.personalScope;
   const isA = scope === 'partner_a';
   const partnerName = isA ? pAName : pBName;
   const p = isA ? m.partnerA : m.partnerB;
+  const optKind = isA ? 'hh-opt-a' : 'hh-opt-b';
 
   const renderSection = (title, sub, sectionKey, items, showActual = false) => {
     const subtotal = items.reduce((s, i) => s + Number(i.amount || 0), 0);
     const actualSum = items.reduce((s, i) => s + Number(i.actual_amount || 0), 0);
+    const allowNeg = sectionKey === 'personal_bill' || sectionKey === 'personal_budgeted';
+    const remainingUnpaid = items
+      .filter((i) => !i.is_paid && Number(i.amount || 0) > 0)
+      .reduce((s, i) => s + Number(i.amount || 0), 0);
+    const finishedCount = items.filter((i) => i.is_paid).length;
+    const isPB = sectionKey === 'personal_budgeted';
+
     return `
     <div class="card">
       <div class="sec-hdr">
@@ -1314,42 +1605,76 @@ function renderPersonal(m) {
         </div>
         <button class="btn btn-primary btn-sm" data-add-section="${scope}|${sectionKey}" type="button">+ Add</button>
       </div>
+      ${isPB
+        ? `<div class="summary-strip-3">
+              <div class="mini-stat">
+                <div class="mini-stat-lbl">Planned Net</div>
+                <div class="mini-stat-val">${fmtMoney(subtotal)}</div>
+              </div>
+              <div class="mini-stat">
+                <div class="mini-stat-lbl">Still To Pay</div>
+                <div class="mini-stat-val">${fmtMoney(remainingUnpaid)}</div>
+              </div>
+              <div class="mini-stat">
+                <div class="mini-stat-lbl">Actual Paid</div>
+                <div class="mini-stat-val">${fmtMoney(actualSum)}</div>
+              </div>
+            </div>
+            <form class="quick-add-box" id="pb-quick-add-form">
+              <div class="seg-tabs" style="margin-bottom:0;padding:3px;">
+                <button type="button" class="seg-tab on" data-pb-mode="expense" style="padding:6px 8px;font-size:12px;">Expense (+)</button>
+                <button type="button" class="seg-tab" data-pb-mode="credit" style="padding:6px 8px;font-size:12px;">Credit / From Pot (-)</button>
+              </div>
+              <div class="quick-add-row">
+                <input class="fi" id="pb-qa-name" type="text" placeholder="Item name…" required style="flex:1;padding:8px 10px;font-size:13.5px;" />
+                <input class="fi num" id="pb-qa-amt" type="number" step="0.01" placeholder="0.00" required style="width:94px;padding:8px 10px;font-size:13.5px;" />
+                <button class="btn btn-primary btn-sm" type="submit" style="padding:8px 12px;">Add</button>
+              </div>
+            </form>`
+        : ''
+      }
       <div class="item-list">
-        ${
-          items.length
-            ? items
-                .map((item) => {
-                  const amt = Number(item.amount || 0);
-                  const isCredit = amt < 0;
-                  return `
-                  <div class="item-row" data-edit-item="${item.id}">
+        ${items.length
+        ? items
+          .map((item) => {
+            const amt = Number(item.amount || 0);
+            const isCredit = amt < 0;
+            return `
+                  <div class="item-row" style="cursor:default;">
                     <div class="item-chk ${item.is_paid ? 'on' : ''}" data-toggle-paid="${item.id}" title="Toggle done">✓</div>
                     <div class="item-main">
                       <div class="item-name">
                         <span>${esc(item.name)}</span>
                         <span class="badge">${esc(item.category)}</span>
+                        ${isCredit ? '<span class="badge emerald">Credit / Pot</span>' : ''}
                         ${item.is_paid ? '<span class="badge emerald">Finished</span>' : ''}
                       </div>
-                      ${
-                        showActual
-                          ? `<div class="item-sub">Expected ${fmtMoney(amt)} · Actual ${fmtMoney(item.actual_amount || 0)}</div>`
-                          : item.notes
-                          ? `<div class="item-sub">${esc(item.notes)}</div>`
-                          : ''
-                      }
+                      ${showActual
+                ? `<div class="item-sub" style="align-items:center;margin-top:4px;">
+                    <span>Plan</span> ${valPillHtml({ kind: 'item-amount', id: item.id, val: amt, allowNeg, small: true, credit: isCredit })}
+                    <span>Actual</span> ${valPillHtml({ kind: 'item-actual', id: item.id, val: item.actual_amount ?? 0, allowNeg, small: true })}
+                  </div>`
+                : item.notes
+                  ? `<div class="item-sub">${esc(item.notes)}</div>`
+                  : ''
+              }
                     </div>
-                    <div class="item-right">
-                      <div class="item-amt ${isCredit ? 'credit' : ''}">${fmtMoney(amt)}</div>
+                    <div class="item-right" style="display:flex;align-items:center;gap:6px;">
+                      ${!showActual ? valPillHtml({ kind: 'item-amount', id: item.id, val: amt, allowNeg, credit: isCredit }) : ''}
+                      <button type="button" class="edit-gear-btn" data-edit-item="${item.id}" title="Edit details">✎</button>
                     </div>
                   </div>`;
-                })
-                .join('')
-            : '<div class="empty-note">Nothing added yet.</div>'
-        }
+          })
+          .join('')
+        : '<div class="empty-note">Nothing added yet.</div>'
+      }
       </div>
       <div class="sec-total-bar">
         <span>Subtotal${showActual ? ` (Actual ${fmtMoney(actualSum)})` : ''}</span>
-        <span class="num">${fmtMoney(subtotal)}</span>
+        <div style="display:flex;align-items:center;gap:8px;">
+          ${isPB && finishedCount > 0 ? `<button type="button" class="btn btn-sm" id="clear-finished-pb-btn">Clear Finished (${finishedCount})</button>` : ''}
+          <span class="num">${fmtMoney(subtotal)}</span>
+        </div>
       </div>
     </div>`;
   };
@@ -1368,9 +1693,8 @@ function renderPersonal(m) {
       <div class="sec-hdr">
         <div>
           <div class="sec-title">${esc(partnerName)}'s Monthly Reste</div>
-          <div class="sec-sub">Personal disposable after joint transfer &amp; personal items</div>
+          <div class="sec-sub">Transfer auto-rounds bills up to nearest £50 + Optional</div>
         </div>
-        <button class="btn btn-sm" id="personal-edit-transfers-btn" type="button">Edit Transfer</button>
       </div>
       <div style="font-size:28px;font-weight:700;margin:4px 0 10px;" class="num">${fmtMoney(p.disposable)}</div>
       <div class="kv-grid">
@@ -1383,7 +1707,7 @@ function renderPersonal(m) {
           <div class="kv-val">${fmtMoney(p.totalExpenditure)}</div>
         </div>
         <div class="kv-box">
-          <div class="kv-lbl">Joint Account Transfer</div>
+          <div class="kv-lbl">Joint Transfer (Auto)</div>
           <div class="kv-val">${fmtMoney(p.transfer)}</div>
         </div>
         <div class="kv-box">
@@ -1391,20 +1715,20 @@ function renderPersonal(m) {
           <div class="kv-val">${fmtMoney(p.billsShare)}</div>
         </div>
         <div class="kv-box">
-          <div class="kv-lbl">Joint Extra</div>
+          <div class="kv-lbl">£50 Round-Up Extra</div>
           <div class="kv-val">${fmtMoney(p.jointExtra)}</div>
         </div>
         <div class="kv-box">
-          <div class="kv-lbl">Joint Optional</div>
-          <div class="kv-val">${fmtMoney(p.jointOptional)}</div>
+          <div class="kv-lbl">Joint Optional (+/-)</div>
+          <div style="margin-top:4px;">${valPillHtml({ kind: optKind, val: p.jointOptional, allowNeg: true })}</div>
         </div>
       </div>
     </div>
 
+    ${renderSection('Personal Budgeted Items', 'Tap any amount to amend · Use Credit (-) for pots/reimbursements', 'personal_budgeted', p.budgeted, true)}
     ${renderSection('Debt Repayment', 'Personal credit cards & loans', 'debt', p.debts, true)}
     ${renderSection('Personal Bills', 'Direct debits, phone & subscriptions', 'personal_bill', p.bills, false)}
     ${renderSection('Savings & Investments', 'Monthly transfers & pots', 'savings', p.savings, false)}
-    ${renderSection('Personal Budgeted Items', 'One-off items, reimbursements (use -amount for credits)', 'personal_budgeted', p.budgeted, true)}
   `;
 
   $('panel-personal').querySelectorAll('[data-switch-personal]').forEach((b) =>
@@ -1413,8 +1737,64 @@ function renderPersonal(m) {
       renderPersonal(m);
     })
   );
-  $('personal-edit-transfers-btn')?.addEventListener('click', () => openSplitTransfersModal(m));
+
+  // Quick-add form inside Personal Budgeted Items
+  let pbQuickMode = 'expense';
+  $('panel-personal').querySelectorAll('[data-pb-mode]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      pbQuickMode = btn.dataset.pbMode;
+      $('panel-personal').querySelectorAll('[data-pb-mode]').forEach((b) => b.classList.toggle('on', b === btn));
+    })
+  );
+  $('pb-quick-add-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = $('pb-qa-name').value.trim();
+    let amt = Math.abs(Number($('pb-qa-amt').value || 0));
+    if (!name || Number.isNaN(amt)) return;
+    if (pbQuickMode === 'credit') amt = -amt;
+    const sortOrder = state.items.filter((i) => i.scope === scope && i.section === 'personal_budgeted').length + 1;
+    await runMutation(
+      {
+        table: 'budget_items',
+        action: 'insert',
+        payload: {
+          household_id: h.id,
+          scope,
+          section: 'personal_budgeted',
+          name,
+          category: pbQuickMode === 'credit' ? 'Savings' : 'Others/Irregular',
+          amount: amt,
+          sort_order: sortOrder,
+          is_paid: false,
+          notes: '',
+        },
+      },
+      `Added ${name} (${fmtMoney(amt)})`
+    );
+  });
+
+  $('clear-finished-pb-btn')?.addEventListener('click', async () => {
+    const finished = p.budgeted.filter((i) => i.is_paid);
+    if (!finished.length) return;
+    if (!confirm(`Remove ${finished.length} finished personal budgeted item(s)?`)) return;
+    const ids = finished.map((i) => i.id);
+    state.items = state.items.filter((i) => !ids.includes(i.id));
+    renderAll();
+    const { error } = await sb.from('budget_items').delete().in('id', ids);
+    if (error) {
+      showToast(error.message);
+      await fetchHouseholdData(h.id);
+      renderAll();
+      return;
+    }
+    await fetchHouseholdData(h.id);
+    renderAll();
+    broadcastChange('Cleared finished personal budgeted items');
+    showToast(`Cleared ${finished.length} finished item(s)`);
+  });
+
   bindItemActions('panel-personal');
+  attachInlineEditors($('panel-personal'));
 }
 
 function renderHouseholdTab(m) {
@@ -1472,17 +1852,16 @@ function renderHouseholdTab(m) {
         <button class="btn btn-sm" id="edit-hh-settings-btn" type="button">Edit Settings</button>
       </div>
       <div class="item-list">${membersHtml}</div>
-      ${
-        myMem
-          ? `<div style="margin-top:12px;display:flex;gap:8px;align-items:center;justify-content:space-between;">
+      ${myMem
+      ? `<div style="margin-top:12px;display:flex;gap:8px;align-items:center;justify-content:space-between;">
               <span style="font-size:12.5px;color:var(--ink2);">Your default personal view:</span>
               <div style="display:flex;gap:6px;">
                 <button class="btn btn-sm ${myMem.partner_slot === 'a' ? 'btn-primary' : ''}" data-set-slot="a" type="button">${esc(h.partner_a_name)}</button>
                 <button class="btn btn-sm ${myMem.partner_slot === 'b' ? 'btn-primary' : ''}" data-set-slot="b" type="button">${esc(h.partner_b_name)}</button>
               </div>
             </div>`
-          : ''
-      }
+      : ''
+    }
     </div>
 
     <div class="card">
@@ -1635,16 +2014,25 @@ function bindItemActions(containerId) {
       const item = state.items.find((i) => i.id === id);
       if (!item) return;
       const nextPaid = !item.is_paid;
+      const payload = { is_paid: nextPaid };
+      if (item.section === 'personal_budgeted' || item.section === 'debt') {
+        if (nextPaid && (item.actual_amount === null || item.actual_amount === undefined || Number(item.actual_amount) === 0)) {
+          payload.actual_amount = Number(item.amount || 0);
+        } else if (!nextPaid && Number(item.actual_amount) === Number(item.amount || 0)) {
+          payload.actual_amount = null;
+        }
+      }
       await runMutation(
-        { table: 'budget_items', action: 'update', id, payload: { is_paid: nextPaid } },
-        `${item.name} marked ${nextPaid ? 'paid' : 'unpaid'}`
+        { table: 'budget_items', action: 'update', id, payload },
+        `${item.name} marked ${nextPaid ? 'finished' : 'open'}`
       );
     })
   );
 
-  root.querySelectorAll('[data-edit-item]').forEach((row) =>
-    row.addEventListener('click', () => {
-      const item = state.items.find((i) => i.id === row.dataset.editItem);
+  root.querySelectorAll('[data-edit-item]').forEach((btn) =>
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const item = state.items.find((i) => i.id === btn.dataset.editItem);
       if (item) openItemModal(item);
     })
   );
@@ -1689,9 +2077,8 @@ function openItemModal(itemOrTemplate) {
             ${allCats.map((c) => `<option value="${esc(c)}" ${c === curCat ? 'selected' : ''}>${esc(c)}</option>`).join('')}
           </select>
         </div>
-        ${
-          isIncome
-            ? `<div class="fg">
+        ${isIncome
+        ? `<div class="fg">
                 <label class="fl" for="im-amt">Joint Amount (${esc(h.currency)})</label>
                 <input class="fi num" id="im-amt" type="number" step="0.01" value="${Number(itemOrTemplate.amount || 0)}" />
               </div>
@@ -1705,8 +2092,8 @@ function openItemModal(itemOrTemplate) {
                   <input class="fi num" id="im-pb" type="number" step="0.01" value="${Number(itemOrTemplate.partner_b_amount || 0)}" />
                 </div>
               </div>`
-            : isPrep
-            ? `<div class="frow">
+        : isPrep
+          ? `<div class="frow">
                 <div class="fg">
                   <label class="fl" for="im-raw">Bill Cost (${esc(h.currency)})</label>
                   <input class="fi num" id="im-raw" type="number" step="0.01" value="${Number(itemOrTemplate.raw_cost ?? itemOrTemplate.amount ?? 0)}" required />
@@ -1715,56 +2102,52 @@ function openItemModal(itemOrTemplate) {
                   <label class="fl" for="im-freq">Payment Period</label>
                   <select class="fi" id="im-freq">
                     ${FREQUENCY_OPTIONS.map(
-                      (f) => `<option value="${f.value}" ${(itemOrTemplate.frequency || 'quarterly') === f.value ? 'selected' : ''}>${f.label}</option>`
-                    ).join('')}
+            (f) => `<option value="${f.value}" ${(itemOrTemplate.frequency || 'quarterly') === f.value ? 'selected' : ''}>${f.label}</option>`
+          ).join('')}
                   </select>
                 </div>
               </div>
               <div class="sec-sub" id="im-prep-preview" style="margin-bottom:12px;"></div>`
-            : `<div class="frow">
+          : `<div class="frow">
                 <div class="fg">
                   <label class="fl" for="im-amt">Amount (${esc(h.currency)})</label>
                   <input class="fi num" id="im-amt" type="number" step="0.01" value="${Number(itemOrTemplate.amount || 0)}" required />
                 </div>
-                ${
-                  hasActual
-                    ? `<div class="fg">
+                ${hasActual
+            ? `<div class="fg">
                         <label class="fl" for="im-actual">Actual Paid (optional)</label>
                         <input class="fi num" id="im-actual" type="number" step="0.01" value="${itemOrTemplate.actual_amount ?? ''}" placeholder="0.00" />
                       </div>`
-                    : `<div class="fg">
+            : `<div class="fg">
                         <label class="fl" for="im-paidby">Paid By (optional)</label>
                         <input class="fi" id="im-paidby" type="text" value="${esc(itemOrTemplate.paid_by || '')}" placeholder="e.g. Joint" />
                       </div>`
-                }
+          }
               </div>`
-        }
-        ${
-          scope === 'joint' && !isIncome
-            ? `<div class="fg">
+      }
+        ${scope === 'joint' && !isIncome
+        ? `<div class="fg">
                 <label class="fl" for="im-split">Custom ${esc(pA)} Split % (leave blank for household default)</label>
-                <input class="fi num" id="im-split" type="number" min="0" max="100" step="0.1" value="${
-                  itemOrTemplate.custom_split_a !== null && itemOrTemplate.custom_split_a !== undefined
-                    ? (Number(itemOrTemplate.custom_split_a) * 100).toFixed(1)
-                    : ''
-                }" placeholder="Default" />
+                <input class="fi num" id="im-split" type="number" min="0" max="100" step="0.1" value="${itemOrTemplate.custom_split_a !== null && itemOrTemplate.custom_split_a !== undefined
+          ? (Number(itemOrTemplate.custom_split_a) * 100).toFixed(1)
+          : ''
+        }" placeholder="Default" />
               </div>`
-            : ''
-        }
+        : ''
+      }
         <div class="fg">
           <label class="fl" for="im-notes">Notes (optional)</label>
           <input class="fi" id="im-notes" type="text" value="${esc(itemOrTemplate.notes || '')}" placeholder="Reference or due date" />
         </div>
-        ${
-          !isIncome
-            ? `<div class="fg">
+        ${!isIncome
+        ? `<div class="fg">
                 <label class="toggle-row">
                   <span style="font-size:13.5px;font-weight:500;">Marked as Paid / Finished</span>
                   <input id="im-paid" type="checkbox" ${itemOrTemplate.is_paid ? 'checked' : ''} />
                 </label>
               </div>`
-            : ''
-        }
+        : ''
+      }
         <div class="sheet-actions">
           ${!isNew ? '<button class="btn btn-danger" id="im-delete-btn" type="button" style="margin-right:auto;">Delete</button>' : ''}
           <button class="btn" id="im-cancel-btn" type="button">Cancel</button>
@@ -1932,10 +2315,10 @@ function openSpendModal(existingLog = null, presetPot = null) {
 
 function openSplitTransfersModal(m) {
   const h = state.household;
-  const pA = h.partner_a_name || 'Partner A';
-  const pB = h.partner_b_name || 'Partner B';
+  const pA = h.partner_a_name || 'Partner 1';
+  const pB = h.partner_b_name || 'Partner 2';
 
-  openModal('Cost Split & Joint Transfers', (body) => {
+  openModal('Cost Split & Optional Adjustments', (body) => {
     body.innerHTML = `
       <form id="split-modal-form">
         <div class="fg">
@@ -1948,25 +2331,16 @@ function openSplitTransfersModal(m) {
         </div>
         <div class="fg" id="sp-custom-wrap">
           <label class="fl" for="sp-pct-a">${esc(pA)}'s Split Percentage (%)</label>
-          <input class="fi num" id="sp-pct-a" type="number" min="0" max="100" step="0.5" value="${(Number(h.partner_a_split || 0.5) * 100).toFixed(1)}" />
+          <input class="fi num" id="sp-pct-a" type="number" min="0" max="100" step="1" value="${Math.round(Number(h.partner_a_split || 0.5) * 100)}" />
         </div>
+        <div class="sec-sub" style="margin-bottom:10px;">Joint Transfers automatically round each partner's bills share up to the nearest £50, plus Optional (+/-).</div>
         <div class="frow">
           <div class="fg">
-            <label class="fl" for="sp-tr-a">${esc(pA)} Joint Transfer</label>
-            <input class="fi num" id="sp-tr-a" type="number" step="0.01" value="${Number(h.partner_a_joint_transfer || 0)}" />
-          </div>
-          <div class="fg">
-            <label class="fl" for="sp-tr-b">${esc(pB)} Joint Transfer</label>
-            <input class="fi num" id="sp-tr-b" type="number" step="0.01" value="${Number(h.partner_b_joint_transfer || 0)}" />
-          </div>
-        </div>
-        <div class="frow">
-          <div class="fg">
-            <label class="fl" for="sp-opt-a">${esc(pA)} Joint Optional</label>
+            <label class="fl" for="sp-opt-a">${esc(pA)} Joint Optional (+/-)</label>
             <input class="fi num" id="sp-opt-a" type="number" step="0.01" value="${Number(h.partner_a_joint_optional || 0)}" />
           </div>
           <div class="fg">
-            <label class="fl" for="sp-opt-b">${esc(pB)} Joint Optional</label>
+            <label class="fl" for="sp-opt-b">${esc(pB)} Joint Optional (+/-)</label>
             <input class="fi num" id="sp-opt-b" type="number" step="0.01" value="${Number(h.partner_b_joint_optional || 0)}" />
           </div>
         </div>
@@ -1997,13 +2371,11 @@ function openSplitTransfersModal(m) {
           payload: {
             split_mode: mode,
             partner_a_split: pctA,
-            partner_a_joint_transfer: Number($('sp-tr-a').value || 0),
-            partner_b_joint_transfer: Number($('sp-tr-b').value || 0),
             partner_a_joint_optional: Number($('sp-opt-a').value || 0),
             partner_b_joint_optional: Number($('sp-opt-b').value || 0),
           },
         },
-        'Updated cost split & transfers'
+        'Updated cost split & optional adjustments'
       );
     });
   });
@@ -2079,11 +2451,11 @@ function openCategoriesModal() {
         <div class="fl">Expense Categories (${expCats.length})</div>
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">
           ${expCats
-            .map(
-              (c, idx) =>
-                `<span class="badge" style="display:inline-flex;align-items:center;gap:5px;padding:4px 9px;">${esc(c)} <button type="button" data-rm-exp="${idx}" style="border:none;background:none;cursor:pointer;font-weight:700;color:var(--red);">×</button></span>`
-            )
-            .join('')}
+        .map(
+          (c, idx) =>
+            `<span class="badge" style="display:inline-flex;align-items:center;gap:5px;padding:4px 9px;">${esc(c)} <button type="button" data-rm-exp="${idx}" style="border:none;background:none;cursor:pointer;font-weight:700;color:var(--red);">×</button></span>`
+        )
+        .join('')}
         </div>
         <div style="display:flex;gap:6px;">
           <input class="fi" id="new-exp-cat" type="text" placeholder="Add expense category…" />
@@ -2094,11 +2466,11 @@ function openCategoriesModal() {
         <div class="fl">Income Categories (${incCats.length})</div>
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">
           ${incCats
-            .map(
-              (c, idx) =>
-                `<span class="badge emerald" style="display:inline-flex;align-items:center;gap:5px;padding:4px 9px;">${esc(c)} <button type="button" data-rm-inc="${idx}" style="border:none;background:none;cursor:pointer;font-weight:700;color:var(--red);">×</button></span>`
-            )
-            .join('')}
+        .map(
+          (c, idx) =>
+            `<span class="badge emerald" style="display:inline-flex;align-items:center;gap:5px;padding:4px 9px;">${esc(c)} <button type="button" data-rm-inc="${idx}" style="border:none;background:none;cursor:pointer;font-weight:700;color:var(--red);">×</button></span>`
+        )
+        .join('')}
         </div>
         <div style="display:flex;gap:6px;">
           <input class="fi" id="new-inc-cat" type="text" placeholder="Add income category…" />
