@@ -1,11 +1,11 @@
-const APP_VERSION = 'v9';
+const APP_VERSION = 'v10';
 const CACHE_NAME = `reste-shell-${APP_VERSION}`;
 const SHELL_ASSETS = [
   './',
   './index.html',
-  './styles.css?v=9',
-  './app.js?v=9',
-  './budget-engine.js?v=9',
+  './styles.css?v=10',
+  './app.js?v=10',
+  './budget-engine.js?v=10',
   './manifest.json',
   './icon.svg',
   './icon-192.png',

@@ -411,3 +411,143 @@ export function computeBudgetModel(household, items, spendLogs, activeMonth) {
     categoriesSorted,
   };
 }
+
+export function buildArchiveAndInsights(household, items, spendLogs, snapshots, currentCycleKey) {
+  const h = household || {};
+  const list = Array.isArray(items) ? items : [];
+  const logs = Array.isArray(spendLogs) ? spendLogs : [];
+  const snaps = Array.isArray(snapshots) ? snapshots : [];
+  const paydayDay = clampPayday(h.payday_day ?? 1);
+  const pots = list.filter((i) => i.scope === 'joint' && i.section === 'budgeted_expense');
+
+  const snapByKey = {};
+  snaps.forEach((s) => {
+    if (s?.month_key) snapByKey[s.month_key] = s;
+  });
+
+  const logsByKey = {};
+  logs.forEach((l) => {
+    const ck = l.spend_date ? getCycleKeyForDate(l.spend_date, paydayDay) : l.month_key;
+    if (!ck) return;
+    if (!logsByKey[ck]) logsByKey[ck] = [];
+    logsByKey[ck].push(l);
+  });
+
+  const cycleKeys = new Set();
+  Object.keys(snapByKey).forEach((k) => {
+    if (!currentCycleKey || k < currentCycleKey) cycleKeys.add(k);
+  });
+  Object.keys(logsByKey).forEach((k) => {
+    if (!currentCycleKey || k < currentCycleKey) cycleKeys.add(k);
+  });
+
+  const sortedNewestFirst = [...cycleKeys].sort().reverse();
+  const potNamesSet = new Set(pots.map((p) => p.name));
+  snaps.forEach((s) => {
+    Object.keys(s?.pot_totals || {}).forEach((pn) => potNamesSet.add(pn));
+  });
+  logs.forEach((l) => {
+    if (l?.pot_name) potNamesSet.add(l.pot_name);
+  });
+  const potNames = [...potNamesSet];
+
+  const cycles = sortedNewestFirst.map((cycleKey) => {
+    const snap = snapByKey[cycleKey] || null;
+    const receipts = [...(logsByKey[cycleKey] || [])].sort((a, b) =>
+      String(b.spend_date || '').localeCompare(String(a.spend_date || ''))
+    );
+    const range = getCycleRange(cycleKey, paydayDay);
+    const potTotals = {};
+
+    if (snap?.pot_totals && Object.keys(snap.pot_totals).length) {
+      Object.entries(snap.pot_totals).forEach(([k, v]) => {
+        potTotals[k] = Number(v || 0);
+      });
+    } else {
+      receipts.forEach((l) => {
+        const pn = l.pot_name || 'Other';
+        potTotals[pn] = (potTotals[pn] || 0) + Number(l.amount || 0);
+      });
+    }
+
+    const totalSpent = Object.values(potTotals).reduce((s, v) => s + Number(v || 0), 0);
+    const potBudgets = snap?.summary_json?.pot_budgets || {};
+
+    return {
+      cycleKey,
+      label: snap?.label || range.shortLabel,
+      fullLabel: range.fullLabel,
+      potTotals,
+      potBudgets,
+      totalSpent,
+      receipts,
+      fromSnapshot: Boolean(snap),
+    };
+  });
+
+  const chronological = [...cycles].reverse();
+  const count = cycles.length;
+  const avgTotalSpent = count > 0 ? cycles.reduce((s, c) => s + c.totalSpent, 0) / count : 0;
+  const latestCycle = cycles[0] || null;
+  const prevCycle = cycles[1] || null;
+
+  let highestCycle = null;
+  let lowestCycle = null;
+  cycles.forEach((c) => {
+    if (!highestCycle || c.totalSpent > highestCycle.totalSpent) highestCycle = c;
+    if (!lowestCycle || c.totalSpent < lowestCycle.totalSpent) lowestCycle = c;
+  });
+
+  const totalCurrentPotBudget = pots.reduce((s, p) => s + Number(p.amount || 0), 0);
+  const overallDelta =
+    latestCycle && prevCycle
+      ? latestCycle.totalSpent - prevCycle.totalSpent
+      : latestCycle
+        ? latestCycle.totalSpent - avgTotalSpent
+        : 0;
+  const overallDeltaBase = prevCycle ? prevCycle.totalSpent : avgTotalSpent;
+  const overallDeltaPct = overallDeltaBase > 0 ? (overallDelta / overallDeltaBase) * 100 : 0;
+
+  const perPotInsights = potNames
+    .map((name) => {
+      const potObj = pots.find((p) => p.name === name);
+      const currentBudget = Number(potObj?.amount || 0);
+      const avgSpent =
+        count > 0 ? cycles.reduce((s, c) => s + Number(c.potTotals[name] || 0), 0) / count : 0;
+      const latestArchivedSpent = latestCycle ? Number(latestCycle.potTotals[name] || 0) : 0;
+      const prevArchivedSpent = prevCycle ? Number(prevCycle.potTotals[name] || 0) : null;
+      const momDelta =
+        prevArchivedSpent !== null
+          ? latestArchivedSpent - prevArchivedSpent
+          : latestCycle
+            ? latestArchivedSpent - currentBudget
+            : 0;
+      const base = prevArchivedSpent !== null ? prevArchivedSpent : currentBudget;
+      const momPct = base > 0 ? (momDelta / base) * 100 : 0;
+      return {
+        name,
+        currentBudget,
+        avgSpent,
+        latestArchivedSpent,
+        prevArchivedSpent,
+        momDelta,
+        momPct,
+      };
+    })
+    .filter((p) => p.currentBudget > 0 || p.avgSpent > 0 || p.latestArchivedSpent > 0);
+
+  return {
+    cycles,
+    chronological,
+    count,
+    avgTotalSpent,
+    totalCurrentPotBudget,
+    latestCycle,
+    prevCycle,
+    highestCycle,
+    lowestCycle,
+    overallDelta,
+    overallDeltaPct,
+    perPotInsights,
+  };
+}

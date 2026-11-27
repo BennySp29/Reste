@@ -2,16 +2,16 @@ import {
   DEFAULT_EXPENSE_CATEGORIES,
   DEFAULT_INCOME_CATEGORIES,
   FREQUENCY_OPTIONS,
+  buildArchiveAndInsights,
   clampPayday,
   computeBudgetModel,
   computeMonthlyAmount,
   getCurrentCycleKey,
   getCycleKeyForDate,
   getCycleRange,
-  resolveActiveCycleKey,
-} from './budget-engine.js?v=9';
+} from './budget-engine.js?v=10';
 
-const APP_VERSION = '1.9';
+const APP_VERSION = '2.0';
 
 const SUPABASE_URL = 'https://rpegjcnwtsjdbqrxxzrm.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_3QFbL-uHbTadq5eQpUdDiA_hTicgtOL';
@@ -32,11 +32,15 @@ const state = {
   items: [],
   spendLogs: [],
   snapshots: [],
+  cycleNotices: [],
   activeTab: 'overview',
   personalScope: 'partner_a',
   jointFilterCat: 'All',
   jointSearch: '',
   selectedPieCat: null,
+  splitUnlocked: false,
+  expandedNotices: {},
+  rollingOver: false,
   authMode: 'login',
   darkMode: localStorage.getItem('reste_dark') === '1',
   online: navigator.onLine,
@@ -341,6 +345,7 @@ async function loadProfileAndHousehold() {
   }
 
   await fetchHouseholdData(householdId);
+  await maybeRunCycleRollover();
   if (session?.access_token) {
     await sb.realtime.setAuth(session.access_token);
   }
@@ -348,6 +353,35 @@ async function loadProfileAndHousehold() {
   await flushOfflineQueue();
   showView('app');
   renderAll();
+}
+
+async function maybeRunCycleRollover() {
+  const h = state.household;
+  if (!h || state.rollingOver || !navigator.onLine) return;
+  const curKey = getCurrentCycleKey(h.payday_day);
+  if (h.last_rollover_cycle && h.last_rollover_cycle >= curKey) return;
+
+  state.rollingOver = true;
+  try {
+    const prevLabel = h.last_rollover_cycle ? getCycleRange(h.last_rollover_cycle, h.payday_day).fullLabel : '';
+    const { data } = await sb.rpc('perform_cycle_rollover_rpc', {
+      p_household_id: h.id,
+      p_current_cycle: curKey,
+      p_prev_label: prevLabel,
+    });
+    if (data?.rolled_over) {
+      await fetchHouseholdData(h.id);
+      renderAll();
+      broadcastChange('New monthly cycle started — pots reset to £0');
+      showToast('New monthly cycle started — pots archived & reset');
+    } else if (data?.initialized) {
+      await fetchHouseholdData(h.id);
+    }
+  } catch {
+    // ignore transient offline rollover error
+  } finally {
+    state.rollingOver = false;
+  }
 }
 
 function getMyPartnerSlot() {
@@ -368,13 +402,14 @@ function getMyPersonalScope() {
 }
 
 async function fetchHouseholdData(householdId) {
-  const [hhRes, memRes, profsRes, itemsRes, logsRes, snapRes] = await Promise.all([
+  const [hhRes, memRes, profsRes, itemsRes, logsRes, snapRes, noticeRes] = await Promise.all([
     sb.from('households').select('*').eq('id', householdId).single(),
     sb.from('household_members').select('*').eq('household_id', householdId),
     sb.from('profiles').select('id, username, display_name, avatar_color'),
     sb.from('budget_items').select('*').eq('household_id', householdId).order('sort_order', { ascending: true }).order('created_at', { ascending: true }),
     sb.from('spend_logs').select('*').eq('household_id', householdId).order('spend_date', { ascending: false }).order('created_at', { ascending: false }),
     sb.from('monthly_snapshots').select('*').eq('household_id', householdId).order('month_key', { ascending: true }),
+    sb.from('cycle_notices').select('*').eq('household_id', householdId).eq('dismissed', false).order('created_at', { ascending: false }),
   ]);
 
   if (hhRes.error || !hhRes.data) {
@@ -392,6 +427,7 @@ async function fetchHouseholdData(householdId) {
   state.items = itemsRes.data || [];
   state.spendLogs = logsRes.data || [];
   state.snapshots = snapRes.data || [];
+  state.cycleNotices = noticeRes.data || [];
 
   // Always lock personal view strictly to the authenticated user's own partner slot
   state.personalScope = getMyPersonalScope();
@@ -451,6 +487,11 @@ function setupRealtime(householdId) {
     .on(
       'postgres_changes',
       { event: '*', schema: 'public', table: 'household_members', filter: `household_id=eq.${householdId}` },
+      () => scheduleRefresh()
+    )
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'cycle_notices', filter: `household_id=eq.${householdId}` },
       () => scheduleRefresh()
     )
     .on('broadcast', { event: 'sync_ping' }, ({ payload }) => {
@@ -523,6 +564,16 @@ function applyOptimisticState(op) {
     } else if (op.action === 'insert') {
       state.spendLogs = [{ id: `tmp_${Date.now()}`, ...op.payload }, ...state.spendLogs];
     }
+  } else if (op.table === 'cycle_notices') {
+    if (op.action === 'update') {
+      if (op.payload?.dismissed) {
+        state.cycleNotices = state.cycleNotices.filter((n) => n.id !== op.id);
+      } else {
+        state.cycleNotices = state.cycleNotices.map((n) => (n.id === op.id ? { ...n, ...op.payload } : n));
+      }
+    } else if (op.action === 'delete') {
+      state.cycleNotices = state.cycleNotices.filter((n) => n.id !== op.id);
+    }
   }
 }
 
@@ -559,13 +610,23 @@ async function runMutation(op, toastMsg) {
         .from('monthly_snapshots')
         .upsert(entry.payload, { onConflict: 'household_id,month_key' });
       if (error) throw error;
+    } else if (entry.table === 'cycle_notices') {
+      if (entry.action === 'update') {
+        const { error } = await sb.from('cycle_notices').update(entry.payload).eq('id', entry.id);
+        if (error) throw error;
+      } else if (entry.action === 'delete') {
+        const { error } = await sb.from('cycle_notices').delete().eq('id', entry.id);
+        if (error) throw error;
+      }
     }
   };
 
   const targetScope =
     op.table === 'budget_items'
       ? op.payload?.scope || state.items.find((i) => i.id === op.id)?.scope
-      : 'joint';
+      : op.table === 'cycle_notices'
+        ? state.cycleNotices.find((n) => n.id === op.id)?.scope
+        : 'joint';
   const isPrivateOp = targetScope === 'partner_a' || targetScope === 'partner_b';
 
   applyOptimisticState(op);
@@ -637,6 +698,9 @@ async function runMutationDirect(entry) {
     return sb.from('households').update(entry.payload).eq('id', entry.id).throwOnError();
   } else if (entry.table === 'monthly_snapshots') {
     return sb.from('monthly_snapshots').upsert(entry.payload, { onConflict: 'household_id,month_key' }).throwOnError();
+  } else if (entry.table === 'cycle_notices') {
+    if (entry.action === 'update') return sb.from('cycle_notices').update(entry.payload).eq('id', entry.id).throwOnError();
+    if (entry.action === 'delete') return sb.from('cycle_notices').delete().eq('id', entry.id).throwOnError();
   }
 }
 
@@ -776,6 +840,7 @@ function showView(view) {
 
 function setActiveTab(tab) {
   state.activeTab = tab;
+  state.splitUnlocked = false;
   document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach((n) => n.classList.remove('active'));
   const panel = $(`panel-${tab}`);
@@ -801,7 +866,7 @@ function renderAll() {
   if (!state.household) return;
   const mc = $('main-content');
   const prevScroll = mc ? mc.scrollTop : 0;
-  const activeMonth = resolveActiveCycleKey(state.household);
+  const activeMonth = getCurrentCycleKey(state.household?.payday_day);
   const model = computeBudgetModel(state.household, state.items, state.spendLogs, activeMonth);
 
   if (state.activeTab === 'overview') renderOverview(model, activeMonth);
@@ -966,15 +1031,25 @@ function renderSplitSliderCard(m, compact = false) {
   const pA = h.partner_a_name || 'Partner 1';
   const pB = h.partner_b_name || 'Partner 2';
   const pctNum = Math.round(m.split.activeA * 100);
+  const pctFill = (m.split.activeA * 100).toFixed(1);
+  const unlocked = Boolean(state.splitUnlocked);
 
   return `
     <div class="card">
       <div class="sec-hdr">
         <div>
-          <div class="sec-title">Bill Split &amp; Auto Joint Transfers</div>
-          <div class="sec-sub">Suggested by income: ${fmtPct(m.split.suggestedA)} / ${fmtPct(m.split.suggestedB)} · Rounds up to nearest £50</div>
+          <div class="sec-title">Bill Split &amp; Auto Transfers</div>
+          <div class="sec-sub">${
+            unlocked
+              ? `Slide to adjust (${fmtPct(m.split.suggestedA)} suggested), then tap Done`
+              : `Suggested by income: ${fmtPct(m.split.suggestedA)} / ${fmtPct(m.split.suggestedB)}`
+          }</div>
         </div>
-        <button class="btn btn-sm" id="split-preset-sug" type="button" style="${h.split_mode === 'suggested' ? 'border-color:var(--emerald);background:var(--emerald-p);color:var(--emerald);' : ''}">Use Suggested</button>
+        ${
+          unlocked
+            ? '<button class="btn btn-primary btn-sm" data-lock-split="1" type="button">Done</button>'
+            : '<button class="btn btn-sm" data-unlock-split="1" type="button">Adjust Split</button>'
+        }
       </div>
 
       <div style="display:flex;justify-content:space-between;align-items:baseline;font-size:13px;font-weight:700;">
@@ -982,16 +1057,19 @@ function renderSplitSliderCard(m, compact = false) {
         <span style="color:var(--gold);">${esc(pB)}: <span class="num" data-live-split-b>${fmtPct(m.split.activeB)}</span> (<span class="num" data-live-bills-b>${fmtMoney(m.jointBillsB)}</span>)</span>
       </div>
 
-      <div class="split-slider-wrap">
-        <input type="range" min="0" max="100" step="1" value="${pctNum}" class="split-slider" id="bill-split-slider"
-          style="background:linear-gradient(to right, var(--emerald) 0%, var(--emerald) ${(m.split.activeA * 100).toFixed(1)}%, var(--gold) ${(m.split.activeA * 100).toFixed(1)}%, var(--gold) 100%);"
-          aria-label="Percentage split slider" />
-      </div>
-
-      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:4px;">
-        <button class="chip ${h.split_mode === 'equal' ? 'on' : ''}" id="split-preset-eq" type="button">50 / 50 Equal</button>
-        <button class="chip ${h.split_mode === 'suggested' ? 'on' : ''}" id="split-preset-sug-chip" type="button">Income Match (${fmtPct(m.split.suggestedA)})</button>
-      </div>
+      ${
+        unlocked
+          ? `<div class="split-slider-wrap">
+               <input type="range" min="0" max="100" step="1" value="${pctNum}" class="split-slider" id="bill-split-slider"
+                 style="background:linear-gradient(to right, var(--emerald) 0%, var(--emerald) ${pctFill}%, var(--gold) ${pctFill}%, var(--gold) 100%);"
+                 aria-label="Percentage split slider" />
+             </div>
+             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:4px;">
+               <button class="chip ${h.split_mode === 'equal' ? 'on' : ''}" id="split-preset-eq" type="button">50 / 50 Equal</button>
+               <button class="chip ${h.split_mode === 'suggested' ? 'on' : ''}" id="split-preset-sug-chip" type="button">Income Match (${fmtPct(m.split.suggestedA)})</button>
+             </div>`
+          : `<div class="split-static-track" aria-hidden="true"><div class="split-static-fill" style="width:${pctFill}%"></div></div>`
+      }
 
       ${compact
       ? `<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--ink2);margin-top:8px;padding-top:8px;border-top:1px dashed var(--paper3);">
@@ -1021,12 +1099,21 @@ function renderSplitSliderCard(m, compact = false) {
 
 function bindSplitSlider(rootEl) {
   if (!rootEl) return;
-  const slider = rootEl.querySelector('#bill-split-slider');
   const h = state.household;
   if (!h) return;
 
+  rootEl.querySelector('[data-unlock-split]')?.addEventListener('click', () => {
+    state.splitUnlocked = true;
+    renderAll();
+  });
+  rootEl.querySelector('[data-lock-split]')?.addEventListener('click', () => {
+    state.splitUnlocked = false;
+    renderAll();
+  });
+
+  const slider = rootEl.querySelector('#bill-split-slider');
   const updateLiveDom = () => {
-    const activeMonth = resolveActiveCycleKey(h);
+    const activeMonth = getCurrentCycleKey(h.payday_day);
     const live = computeBudgetModel(h, state.items, state.spendLogs, activeMonth);
     const pctStr = (live.split.activeA * 100).toFixed(1);
     if (slider) {
@@ -1052,12 +1139,6 @@ function bindSplitSlider(rootEl) {
     h.partner_a_split = val / 100;
     rootEl.querySelector('#split-preset-eq')?.classList.remove('on');
     rootEl.querySelector('#split-preset-sug-chip')?.classList.remove('on');
-    const sugBtn = rootEl.querySelector('#split-preset-sug');
-    if (sugBtn) {
-      sugBtn.style.borderColor = '';
-      sugBtn.style.background = '';
-      sugBtn.style.color = '';
-    }
     updateLiveDom();
   });
 
@@ -1071,6 +1152,7 @@ function bindSplitSlider(rootEl) {
   });
 
   const applyPreset = async (mode) => {
+    state.splitUnlocked = false;
     await runMutation(
       { table: 'households', action: 'update', id: h.id, payload: { split_mode: mode } },
       mode === 'equal' ? 'Split set to 50% / 50%' : 'Split matched to income'
@@ -1078,8 +1160,61 @@ function bindSplitSlider(rootEl) {
   };
 
   rootEl.querySelector('#split-preset-eq')?.addEventListener('click', () => applyPreset('equal'));
-  rootEl.querySelector('#split-preset-sug')?.addEventListener('click', () => applyPreset('suggested'));
   rootEl.querySelector('#split-preset-sug-chip')?.addEventListener('click', () => applyPreset('suggested'));
+}
+
+function renderUnpaidNoticesHtml(scopes) {
+  const notices = state.cycleNotices.filter((n) => !n.dismissed && scopes.includes(n.scope));
+  if (!notices.length) return '';
+  return notices
+    .map((n) => {
+      const items = Array.isArray(n.unpaid_items) ? n.unpaid_items : [];
+      const expanded = Boolean(state.expandedNotices[n.id]);
+      const kindLbl = n.scope === 'joint' ? 'joint bill(s)' : 'personal item(s)';
+      return `
+        <div class="notice-banner" role="region" aria-label="Last month unpaid notice">
+          <div class="notice-top">
+            <div>
+              <div class="notice-title">Last month (${esc(n.cycle_label)}): ${items.length} ${kindLbl} weren't ticked</div>
+              <div class="notice-sub">Review &amp; clear once you're happy everything is settled</div>
+            </div>
+            <div class="notice-actions">
+              <button type="button" class="btn btn-sm" data-toggle-notice="${esc(n.id)}">${expanded ? 'Hide' : 'Details'}</button>
+              <button type="button" class="btn btn-sm btn-primary" data-dismiss-notice="${esc(n.id)}">Clear</button>
+            </div>
+          </div>
+          ${
+            expanded
+              ? `<div class="notice-items">
+                   ${items
+                     .map(
+                       (it) =>
+                         `<div class="notice-item-row"><span>${esc(it.name)}</span><span class="num">${fmtMoney(it.amount)}</span></div>`
+                     )
+                     .join('')}
+                 </div>`
+              : ''
+          }
+        </div>`;
+    })
+    .join('');
+}
+
+function bindUnpaidNotices(rootEl) {
+  if (!rootEl) return;
+  rootEl.querySelectorAll('[data-toggle-notice]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.toggleNotice;
+      state.expandedNotices[id] = !state.expandedNotices[id];
+      renderAll();
+    })
+  );
+  rootEl.querySelectorAll('[data-dismiss-notice]').forEach((btn) =>
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.dismissNotice;
+      await runMutation({ table: 'cycle_notices', action: 'update', id, payload: { dismissed: true } }, 'Reminder cleared');
+    })
+  );
 }
 
 const PIE_COLORS = ['#1b6b5a', '#c89a3e', '#2b7a9b', '#d46a43', '#6b5ca5', '#3d9970', '#b85468', '#546e7a', '#8c9f4b', '#9c6ade'];
@@ -1203,6 +1338,7 @@ function renderOverview(m, activeMonth) {
     : '<div class="empty-note">No budgeted pots yet. Add one in the Joint tab.</div>';
 
   $('panel-overview').innerHTML = `
+    ${renderUnpaidNoticesHtml(['joint', myScope])}
     <div class="hero-card">
       <div class="hero-top">
         <div>
@@ -1263,6 +1399,7 @@ function renderOverview(m, activeMonth) {
       openSpendModal(null, btn.dataset.logPot);
     })
   );
+  bindUnpaidNotices($('panel-overview'));
   bindCategoryPie($('panel-overview'), m);
   bindSplitSlider($('panel-overview'));
   attachInlineEditors($('panel-overview'));
@@ -1377,6 +1514,7 @@ function renderJoint(m) {
     : '';
 
   $('panel-joint').innerHTML = `
+    ${renderUnpaidNoticesHtml(['joint'])}
     ${renderSplitSliderCard(m, true)}
 
     <div class="fg" style="margin-bottom:10px;">
@@ -1492,6 +1630,7 @@ function renderJoint(m) {
       renderJoint(m);
     })
   );
+  bindUnpaidNotices($('panel-joint'));
   bindSplitSlider($('panel-joint'));
   bindItemActions('panel-joint');
   attachInlineEditors($('panel-joint'));
@@ -1503,82 +1642,21 @@ function renderSpend(m, activeMonth) {
   if (!state.selectedLogPot && pots.length) state.selectedLogPot = pots[0].name;
 
   const paydayDay = m.paydayDay;
-  const currentCycleKey = getCurrentCycleKey(paydayDay);
-  const currentCycleLabel = getCycleRange(currentCycleKey, paydayDay).shortLabel;
-  const isAutoCurrent = !h.active_month || h.active_month === 'current' || !/^\d{4}-\d{2}$/.test(h.active_month);
-
-  const monthsSet = new Set([m.activeCycleKey, currentCycleKey].filter(Boolean));
-  state.spendLogs.forEach((l) => {
-    const ck = l.spend_date ? getCycleKeyForDate(l.spend_date, paydayDay) : l.month_key;
-    if (ck) monthsSet.add(ck);
-  });
-  state.snapshots.forEach((s) => {
-    if (s.month_key) monthsSet.add(s.month_key);
-  });
-  const months = [...monthsSet].sort().reverse();
-
   const totalSpentMonth = m.monthLogs.reduce((s, l) => s + Number(l.amount || 0), 0);
   const totalBudgetMonth = pots.reduce((s, p) => s + Number(p.amount || 0), 0);
-
-  // Build 6-month history columns from snapshots + active cycle
-  const historyRows = [...state.snapshots];
-  if (!historyRows.some((s) => s.month_key === m.activeCycleKey) && m.monthLogs.length) {
-    const liveTotals = {};
-    m.potTrackers.forEach((p) => {
-      liveTotals[p.name] = Number(p.actual.toFixed(2));
-    });
-    historyRows.push({
-      month_key: m.activeCycleKey,
-      label: m.cycleRange.shortLabel + ' (Live)',
-      pot_totals: liveTotals,
-    });
-  }
-
-  const potNames = pots.map((p) => p.name);
-  const histHeaders = potNames.map((n) => `<th class="num">${esc(n)}</th>`).join('');
-  const histTotals = {};
-  potNames.forEach((n) => (histTotals[n] = 0));
-
-  const histBody = historyRows
-    .map((row) => {
-      const cells = potNames
-        .map((n) => {
-          const v = Number(row.pot_totals?.[n] || 0);
-          histTotals[n] += v;
-          return `<td class="num">${fmtMoney(v)}</td>`;
-        })
-        .join('');
-      return `<tr><td>${esc(row.label || getCycleRange(row.month_key, paydayDay).shortLabel)}</td>${cells}</tr>`;
-    })
-    .join('');
-
-  const avgCount = Math.max(1, historyRows.length);
-  const totalCells = potNames.map((n) => `<td class="num"><strong>${fmtMoney(histTotals[n])}</strong></td>`).join('');
-  const avgCells = potNames.map((n) => `<td class="num">${fmtMoney(histTotals[n] / avgCount)}</td>`).join('');
+  const currentCycleKey = getCurrentCycleKey(paydayDay);
 
   $('panel-spend').innerHTML = `
     <div class="card">
       <div class="sec-hdr">
         <div>
-          <div class="sec-title">${isAutoCurrent ? 'Current Cycle' : 'Selected Cycle'}: ${esc(m.cycleRange.shortLabel)}</div>
-          <div class="sec-sub">${esc(m.cycleRange.fullLabel)} · Logged <strong class="num">${fmtMoney(totalSpentMonth)}</strong> of <strong class="num">${fmtMoney(totalBudgetMonth)}</strong></div>
+          <div class="sec-title">This Month's Pots · ${esc(m.cycleRange.shortLabel)}</div>
+          <div class="sec-sub">${esc(m.cycleRange.fullLabel)} · Resets to £0 on the ${fmtOrdinal(paydayDay)}</div>
         </div>
-      </div>
-      <div class="cycle-controls-row">
-        <select class="fi" id="spend-payday-select" aria-label="Payday cycle start day">
-          ${buildPaydayOptionsHtml(paydayDay)}
-        </select>
-        <input class="fi" id="spend-month-picker" type="month" value="${esc(m.activeCycleKey)}" aria-label="Choose budget cycle month" />
-      </div>
-      <div class="chip-strip" style="margin-bottom:0;padding-bottom:2px;">
-        <button class="chip ${isAutoCurrent ? 'on' : ''}" data-pick-month="current" type="button">Current (${esc(currentCycleLabel)})</button>
-        ${months
-      .filter((mk) => !(isAutoCurrent && mk === currentCycleKey))
-      .map(
-        (mk) =>
-          `<button class="chip ${!isAutoCurrent && mk === m.activeCycleKey ? 'on' : ''}" data-pick-month="${esc(mk)}" type="button">${esc(getCycleRange(mk, paydayDay).shortLabel)}</button>`
-      )
-      .join('')}
+        <div class="num" style="font-size:15px;font-weight:700;text-align:right;">
+          ${fmtMoney(totalSpentMonth)}
+          <div style="font-size:11px;font-weight:500;color:var(--ink3);">of ${fmtMoney(totalBudgetMonth)}</div>
+        </div>
       </div>
     </div>
 
@@ -1599,7 +1677,7 @@ function renderSpend(m, activeMonth) {
         </div>
         <div class="frow">
           <div class="fg">
-            <label class="fl" for="inline-spend-amt">Amount (${esc(state.household.currency)})</label>
+            <label class="fl" for="inline-spend-amt">Amount (${esc(h.currency)})</label>
             <input class="fi num" id="inline-spend-amt" type="number" step="0.01" placeholder="0.00" required />
           </div>
           <div class="fg">
@@ -1609,7 +1687,7 @@ function renderSpend(m, activeMonth) {
         </div>
         <div class="fg">
           <label class="fl" for="inline-spend-note">Note (optional)</label>
-          <input class="fi" id="inline-spend-note" type="text" placeholder="e.g. Sainsbury's weekly shop" />
+          <input class="fi" id="inline-spend-note" type="text" placeholder="e.g. Weekly shop" />
         </div>
         <button class="btn btn-primary btn-full" type="submit" ${pots.length ? '' : 'disabled'}>Save Spend</button>
       </form>
@@ -1641,8 +1719,8 @@ function renderSpend(m, activeMonth) {
     <div class="card">
       <div class="sec-hdr">
         <div>
-          <div class="sec-title">Receipts (${m.monthLogs.length})</div>
-          <div class="sec-sub">Tap any receipt to edit or remove</div>
+          <div class="sec-title">This Month's Receipts (${m.monthLogs.length})</div>
+          <div class="sec-sub">Tap any amount to amend or ✎ to edit details</div>
         </div>
       </div>
       <div class="item-list">
@@ -1668,66 +1746,13 @@ function renderSpend(m, activeMonth) {
               </div>`
         )
         .join('')
-      : '<div class="empty-note">No receipts logged in this month yet.</div>'}
+      : '<div class="empty-note">No receipts logged in this cycle yet.</div>'}
       </div>
     </div>
 
-    <div class="card">
-      <div class="sec-hdr">
-        <div>
-          <div class="sec-title">Monthly History &amp; Averages</div>
-          <div class="sec-sub">Tracks monthly pot totals across saved months</div>
-        </div>
-        <button class="btn btn-sm" id="save-snapshot-btn" type="button">Save Month Snapshot</button>
-      </div>
-      <div class="tbl-wrap">
-        <table class="data-tbl">
-          <thead>
-            <tr><th>Period</th>${histHeaders}</tr>
-          </thead>
-          <tbody>
-            ${histBody || `<tr><td colspan="${1 + potNames.length}" class="empty-note">No monthly snapshots yet.</td></tr>`}
-            ${historyRows.length
-      ? `<tr><td><strong>Total</strong></td>${totalCells}</tr>
-                   <tr><td><strong>Average</strong></td>${avgCells}</tr>`
-      : ''
-    }
-          </tbody>
-        </table>
-      </div>
-    </div>
+    <button type="button" class="btn btn-full" id="spend-open-archive-btn" style="margin-bottom:14px;">Previous Months &amp; Spending Insights →</button>
   `;
 
-  $('spend-payday-select')?.addEventListener('change', async (e) => {
-    const nextDay = clampPayday(e.target.value);
-    const label = nextDay === 1 ? '1st of each month' : `${fmtOrdinal(nextDay)} to ${fmtOrdinal(nextDay - 1)}`;
-    await runMutation(
-      { table: 'households', action: 'update', id: h.id, payload: { payday_day: nextDay } },
-      `Payday cycle set to ${label}`
-    );
-  });
-  $('spend-month-picker')?.addEventListener('change', async (e) => {
-    if (e.target.value) {
-      const nextVal = e.target.value;
-      await runMutation(
-        { table: 'households', action: 'update', id: h.id, payload: { active_month: nextVal } },
-        `Viewing cycle ${getCycleRange(nextVal, paydayDay).shortLabel}`
-      );
-    }
-  });
-  $('panel-spend').querySelectorAll('[data-pick-month]').forEach((b) =>
-    b.addEventListener('click', async () => {
-      const nextVal = b.dataset.pickMonth;
-      const msg =
-        nextVal === 'current'
-          ? `Synced to Current (${currentCycleLabel})`
-          : `Viewing cycle ${getCycleRange(nextVal, paydayDay).shortLabel}`;
-      await runMutation(
-        { table: 'households', action: 'update', id: h.id, payload: { active_month: nextVal } },
-        msg
-      );
-    })
-  );
   $('panel-spend').querySelectorAll('[data-select-pot]').forEach((b) =>
     b.addEventListener('click', () => {
       state.selectedLogPot = b.dataset.selectPot;
@@ -1743,7 +1768,10 @@ function renderSpend(m, activeMonth) {
     if (!potName || Number.isNaN(amt)) return;
     const potObj = pots.find((p) => p.name === potName);
     const monthKey = getCycleKeyForDate(spendDate, paydayDay);
-    const curResolved = resolveActiveCycleKey(h);
+    const msg =
+      monthKey < currentCycleKey
+        ? `Saved ${fmtMoney(amt)} to archived cycle (${getCycleRange(monthKey, paydayDay).shortLabel})`
+        : `Logged ${fmtMoney(amt)} to ${potName}`;
     await runMutation(
       {
         table: 'spend_logs',
@@ -1759,12 +1787,8 @@ function renderSpend(m, activeMonth) {
           note,
         },
       },
-      `Logged ${fmtMoney(amt)} to ${potName}`
+      msg
     );
-    if (h.active_month !== 'current' && monthKey !== curResolved) {
-      const targetActive = monthKey === currentCycleKey ? 'current' : monthKey;
-      await runMutation({ table: 'households', action: 'update', id: h.id, payload: { active_month: targetActive } });
-    }
   });
 
   $('panel-spend').querySelectorAll('[data-edit-log]').forEach((btn) =>
@@ -1774,33 +1798,8 @@ function renderSpend(m, activeMonth) {
       if (log) openSpendModal(log);
     })
   );
+  $('spend-open-archive-btn')?.addEventListener('click', () => openPreviousMonthsModal());
   attachInlineEditors($('panel-spend'));
-
-  $('save-snapshot-btn')?.addEventListener('click', async () => {
-    const potTotals = {};
-    m.potTrackers.forEach((p) => {
-      potTotals[p.name] = Number(p.actual.toFixed(2));
-    });
-    await runMutation(
-      {
-        table: 'monthly_snapshots',
-        action: 'upsert',
-        payload: {
-          household_id: state.household.id,
-          month_key: m.activeCycleKey,
-          label: m.cycleRange.shortLabel,
-          pot_totals: potTotals,
-          summary_json: {
-            total_income: m.totalHouseholdIncome,
-            joint_inflow: m.jointAccountInflow,
-            joint_expenditure: m.jointExpenseSubtotal,
-            joint_reste: m.jointDisposable,
-          },
-        },
-      },
-      `Saved ${m.cycleRange.shortLabel} snapshot`
-    );
-  });
 }
 
 function renderPersonal(m) {
@@ -1908,6 +1907,7 @@ function renderPersonal(m) {
   };
 
   $('panel-personal').innerHTML = `
+    ${renderUnpaidNoticesHtml([scope])}
     <div class="card">
       <div class="sec-hdr">
         <div>
@@ -2005,6 +2005,7 @@ function renderPersonal(m) {
     showToast(`Cleared ${finished.length} finished item(s)`);
   });
 
+  bindUnpaidNotices($('panel-personal'));
   bindItemActions('panel-personal');
   attachInlineEditors($('panel-personal'));
 }
@@ -2012,6 +2013,9 @@ function renderPersonal(m) {
 function renderHouseholdTab(m) {
   const h = state.household;
   const myMem = state.members.find((mem) => mem.user_id === state.user?.id);
+  const paydayDay = clampPayday(h.payday_day);
+  const curCycleKey = getCurrentCycleKey(paydayDay);
+  const archive = buildArchiveAndInsights(h, state.items, state.spendLogs, state.snapshots, curCycleKey);
 
   const membersHtml = state.members
     .map((mem) => {
@@ -2085,6 +2089,16 @@ function renderHouseholdTab(m) {
         })()
       : ''
     }
+    </div>
+
+    <div class="card">
+      <div class="sec-hdr">
+        <div>
+          <div class="sec-title">Previous Months &amp; Insights</div>
+          <div class="sec-sub">Pots reset to £0 on the ${fmtOrdinal(paydayDay)} · ${archive.count} archived month(s)</div>
+        </div>
+      </div>
+      <button class="btn btn-full" id="open-archive-btn" type="button">Previous Months &amp; Spending Insights →</button>
     </div>
 
     <div class="card">
@@ -2187,6 +2201,7 @@ function renderHouseholdTab(m) {
   );
 
   $('edit-hh-settings-btn')?.addEventListener('click', () => openHouseholdSettingsModal());
+  $('open-archive-btn')?.addEventListener('click', () => openPreviousMonthsModal());
   $('toggle-lock-joins-btn')?.addEventListener('click', async () => {
     const nextLocked = !h.joins_locked;
     await runMutation(
@@ -2531,7 +2546,6 @@ function openSpendModal(existingLog = null, presetPot = null) {
       const paydayDay = clampPayday(h.payday_day);
       const monthKey = getCycleKeyForDate(spendDate, paydayDay);
       const curCycleKey = getCurrentCycleKey(paydayDay);
-      const curResolved = resolveActiveCycleKey(h);
       state.selectedLogPot = potName;
       closeModal();
 
@@ -2546,22 +2560,174 @@ function openSpendModal(existingLog = null, presetPot = null) {
         note,
       };
       if (isNew) {
-        await runMutation({ table: 'spend_logs', action: 'insert', payload }, `Logged ${fmtMoney(amt)} to ${potName}`);
+        const msg =
+          monthKey < curCycleKey
+            ? `Saved ${fmtMoney(amt)} to archived cycle (${getCycleRange(monthKey, paydayDay).shortLabel})`
+            : `Logged ${fmtMoney(amt)} to ${potName}`;
+        await runMutation({ table: 'spend_logs', action: 'insert', payload }, msg);
       } else {
         await runMutation({ table: 'spend_logs', action: 'update', id: existingLog.id, payload }, `Updated ${potName} receipt`);
-      }
-      if (h.active_month !== 'current' && monthKey !== curResolved) {
-        const targetActive = monthKey === curCycleKey ? 'current' : monthKey;
-        await runMutation({ table: 'households', action: 'update', id: h.id, payload: { active_month: targetActive } });
       }
     });
   });
 }
 
+function openPreviousMonthsModal(initialCycleKey = null) {
+  const h = state.household;
+  if (!h) return;
+  const paydayDay = clampPayday(h.payday_day);
+  const currentCycleKey = getCurrentCycleKey(paydayDay);
+  const archive = buildArchiveAndInsights(h, state.items, state.spendLogs, state.snapshots, currentCycleKey);
+  let selectedKey = initialCycleKey && archive.cycles.some((c) => c.cycleKey === initialCycleKey)
+    ? initialCycleKey
+    : archive.cycles[0]?.cycleKey || '';
+
+  const renderArchiveBody = (body) => {
+    if (!archive.count) {
+      body.innerHTML = `
+        <div class="empty-note" style="padding:18px 8px;">
+          No archived months yet. Whenever a new billing month starts (on the ${fmtOrdinal(paydayDay)}), your previous month's pot spending is automatically archived here and reset to £0.
+        </div>
+        <div class="sheet-actions">
+          <button class="btn btn-primary" id="arch-close-btn" type="button">Close</button>
+        </div>
+      `;
+      $('arch-close-btn')?.addEventListener('click', closeModal);
+      return;
+    }
+
+    const maxTrend = Math.max(1, ...archive.chronological.map((c) => c.totalSpent), archive.totalCurrentPotBudget);
+    const deltaSign = archive.overallDelta > 0.005 ? '↑ ' : archive.overallDelta < -0.005 ? '↓ ' : '';
+    const deltaCls = archive.overallDelta > 0.005 ? 'insight-delta-up' : archive.overallDelta < -0.005 ? 'insight-delta-down' : '';
+    const deltaText = archive.prevCycle
+      ? `${deltaSign}${fmtMoney(Math.abs(archive.overallDelta))} (${Math.abs(archive.overallDeltaPct).toFixed(0)}%) vs prev`
+      : `${deltaSign}${fmtMoney(Math.abs(archive.overallDelta))} vs avg`;
+
+    const trendBarsHtml = archive.chronological
+      .slice(-6)
+      .map((c) => {
+        const w = Math.min(100, (c.totalSpent / maxTrend) * 100);
+        return `
+          <div class="insight-trend-row">
+            <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px;">
+              <span>${esc(c.label)}</span>
+              <span class="num" style="font-weight:600;">${fmtMoney(c.totalSpent)}</span>
+            </div>
+            <div class="bar-track" style="height:6px;"><div class="bar-fill" style="width:${w.toFixed(1)}%"></div></div>
+          </div>`;
+      })
+      .join('');
+
+    const potInsightsHtml = archive.perPotInsights
+      .map((p) => {
+        const dSign = p.momDelta > 0.005 ? '↑ ' : p.momDelta < -0.005 ? '↓ ' : '';
+        const dCls = p.momDelta > 0.005 ? 'insight-delta-up' : p.momDelta < -0.005 ? 'insight-delta-down' : '';
+        const cmpLabel = p.prevArchivedSpent !== null ? 'vs prev' : 'vs budget';
+        return `
+          <div class="item-row" style="cursor:default;padding:8px 0;">
+            <div class="item-main">
+              <div class="item-name">${esc(p.name)}</div>
+              <div class="item-sub">Avg ${fmtMoney(p.avgSpent)}/mo · Budget ${fmtMoney(p.currentBudget)}</div>
+            </div>
+            <div class="item-right">
+              <div class="item-amt ${dCls}">${dSign}${fmtMoney(Math.abs(p.momDelta))}</div>
+              <div class="item-split">${cmpLabel}</div>
+            </div>
+          </div>`;
+      })
+      .join('');
+
+    const chosen = archive.cycles.find((c) => c.cycleKey === selectedKey) || archive.cycles[0];
+    const potEntries = Object.entries(chosen?.potTotals || {});
+    const chosenPotsHtml = potEntries.length
+      ? potEntries
+          .map(([potName, spent]) => {
+            const b = chosen.potBudgets?.[potName];
+            return `
+              <div class="notice-item-row" style="padding:5px 0;border-bottom:1px solid var(--paper2);">
+                <span>${esc(potName)}</span>
+                <span class="num" style="font-weight:600;">${fmtMoney(spent)}${b !== undefined ? ` / ${fmtMoney(b)}` : ''}</span>
+              </div>`;
+          })
+          .join('')
+      : '<div class="empty-note">No pot totals recorded for this cycle.</div>';
+
+    const chosenReceiptsHtml = chosen?.receipts?.length
+      ? chosen.receipts
+          .map(
+            (l) => `
+              <div class="item-row" style="cursor:default;padding:7px 0;">
+                <div class="item-main">
+                  <div class="item-name">
+                    <span>${esc(l.pot_name)}</span>
+                    <span class="badge">${esc(l.spend_date)}</span>
+                  </div>
+                  ${l.note ? `<div class="item-sub">${esc(l.note)}</div>` : ''}
+                </div>
+                <div class="item-amt">${fmtMoney(l.amount)}</div>
+              </div>`
+          )
+          .join('')
+      : '<div class="empty-note">Summary total archived without individual receipt rows.</div>';
+
+    body.innerHTML = `
+      <div class="fg">
+        <div class="sec-title" style="font-size:15.5px;margin-bottom:8px;">Spending Insights</div>
+        <div class="summary-strip-3">
+          <div class="mini-stat">
+            <div class="mini-stat-lbl">Monthly Avg</div>
+            <div class="mini-stat-val">${fmtMoney(archive.avgTotalSpent)}</div>
+          </div>
+          <div class="mini-stat">
+            <div class="mini-stat-lbl">Latest Closed</div>
+            <div class="mini-stat-val">${fmtMoney(archive.latestCycle?.totalSpent || 0)}</div>
+          </div>
+          <div class="mini-stat">
+            <div class="mini-stat-lbl">Trend</div>
+            <div class="mini-stat-val ${deltaCls}" style="font-size:11.5px;">${esc(deltaText)}</div>
+          </div>
+        </div>
+        ${trendBarsHtml}
+        <div class="item-list" style="margin-top:6px;">${potInsightsHtml}</div>
+      </div>
+
+      <div class="fg" style="padding-top:10px;border-top:1.5px dashed var(--paper3);">
+        <label class="fl" for="arch-cycle-select">Inspect Previous Month</label>
+        <select class="fi" id="arch-cycle-select">
+          ${archive.cycles
+            .map(
+              (c) =>
+                `<option value="${esc(c.cycleKey)}" ${c.cycleKey === chosen.cycleKey ? 'selected' : ''}>${esc(c.label)} (${fmtMoney(c.totalSpent)})</option>`
+            )
+            .join('')}
+        </select>
+        <div style="margin-top:10px;">
+          <div class="fl" style="margin-bottom:4px;">Pot Totals · ${esc(chosen.fullLabel)}</div>
+          ${chosenPotsHtml}
+        </div>
+        <div style="margin-top:10px;">
+          <div class="fl" style="margin-bottom:4px;">Receipts (${chosen.receipts.length})</div>
+          <div class="item-list">${chosenReceiptsHtml}</div>
+        </div>
+      </div>
+
+      <div class="sheet-actions">
+        <button class="btn btn-primary" id="arch-close-btn" type="button">Done</button>
+      </div>
+    `;
+
+    $('arch-cycle-select')?.addEventListener('change', (e) => {
+      selectedKey = e.target.value;
+      renderArchiveBody(body);
+    });
+    $('arch-close-btn')?.addEventListener('click', closeModal);
+  };
+
+  openModal('Previous Months & Insights', renderArchiveBody);
+}
+
 function openHouseholdSettingsModal() {
   const h = state.household;
-  const isAuto = !h.active_month || h.active_month === 'current' || !/^\d{4}-\d{2}$/.test(h.active_month);
-  const resolved = resolveActiveCycleKey(h);
   openModal('Household Settings', (body) => {
     body.innerHTML = `
       <form id="hh-settings-form">
@@ -2585,23 +2751,10 @@ function openHouseholdSettingsModal() {
             <input class="fi" id="hs-cur" type="text" maxlength="4" value="${esc(h.currency || '£')}" required />
           </div>
           <div class="fg">
-            <label class="fl" for="hs-payday">Payday / Cycle Start</label>
+            <label class="fl" for="hs-payday">Payday / Reset Day</label>
             <select class="fi" id="hs-payday">
               ${buildPaydayOptionsHtml(h.payday_day)}
             </select>
-          </div>
-        </div>
-        <div class="frow">
-          <div class="fg">
-            <label class="fl" for="hs-cycle-mode">Active Cycle</label>
-            <select class="fi" id="hs-cycle-mode">
-              <option value="current" ${isAuto ? 'selected' : ''}>Current Payday Cycle (Auto)</option>
-              <option value="custom" ${!isAuto ? 'selected' : ''}>Specific Cycle</option>
-            </select>
-          </div>
-          <div class="fg ${isAuto ? 'hidden' : ''}" id="hs-month-wrap">
-            <label class="fl" for="hs-month">Cycle Month</label>
-            <input class="fi" id="hs-month" type="month" value="${esc(resolved)}" />
           </div>
         </div>
         <div class="sheet-actions">
@@ -2610,14 +2763,9 @@ function openHouseholdSettingsModal() {
         </div>
       </form>
     `;
-    $('hs-cycle-mode').addEventListener('change', (ev) => {
-      $('hs-month-wrap').classList.toggle('hidden', ev.target.value === 'current');
-    });
     $('hs-cancel').addEventListener('click', closeModal);
     $('hh-settings-form').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const mode = $('hs-cycle-mode').value;
-      const nextMonth = mode === 'current' ? 'current' : ($('hs-month').value || 'current');
       const nextPayday = clampPayday($('hs-payday').value);
       closeModal();
       await runMutation(
@@ -2631,11 +2779,12 @@ function openHouseholdSettingsModal() {
             partner_b_name: $('hs-pb').value.trim() || 'Partner B',
             currency: $('hs-cur').value.trim() || '£',
             payday_day: nextPayday,
-            active_month: nextMonth,
+            active_month: 'current',
           },
         },
         'Household settings updated'
       );
+      await maybeRunCycleRollover();
     });
   });
 }
@@ -3010,6 +3159,7 @@ function bindGlobalEvents() {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && state.household && navigator.onLine) {
       ensureRealtimeConnected();
+      maybeRunCycleRollover();
       scheduleRefresh();
     }
   });

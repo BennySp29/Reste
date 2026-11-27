@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS public.households (
     currency TEXT NOT NULL DEFAULT '£',
     active_month TEXT NOT NULL DEFAULT 'current',
     payday_day INTEGER NOT NULL DEFAULT 1 CHECK (payday_day >= 1 AND payday_day <= 31),
+    last_rollover_cycle TEXT NOT NULL DEFAULT '',
     partner_a_name TEXT NOT NULL DEFAULT 'Partner 1',
     partner_b_name TEXT NOT NULL DEFAULT 'Partner 2',
     split_mode TEXT NOT NULL DEFAULT 'custom' CHECK (split_mode IN ('custom', 'suggested', 'equal')),
@@ -133,6 +134,18 @@ CREATE TABLE IF NOT EXISTS public.monthly_snapshots (
     UNIQUE (household_id, month_key)
 );
 
+CREATE TABLE IF NOT EXISTS public.cycle_notices (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    household_id UUID NOT NULL REFERENCES public.households(id) ON DELETE CASCADE,
+    scope TEXT NOT NULL CHECK (scope IN ('joint', 'partner_a', 'partner_b')),
+    cycle_key TEXT NOT NULL,
+    cycle_label TEXT NOT NULL,
+    unpaid_items JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dismissed BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (household_id, scope, cycle_key)
+);
+
 -- 2. Indexes for RLS & Query Performance
 CREATE INDEX IF NOT EXISTS idx_profiles_active_household ON public.profiles(active_household_id);
 CREATE INDEX IF NOT EXISTS idx_households_created_by ON public.households(created_by);
@@ -141,6 +154,7 @@ CREATE INDEX IF NOT EXISTS idx_budget_items_household_scope ON public.budget_ite
 CREATE INDEX IF NOT EXISTS idx_spend_logs_household_month ON public.spend_logs(household_id, month_key, spend_date DESC);
 CREATE INDEX IF NOT EXISTS idx_spend_logs_budget_item ON public.spend_logs(budget_item_id);
 CREATE INDEX IF NOT EXISTS idx_monthly_snapshots_household ON public.monthly_snapshots(household_id, month_key);
+CREATE INDEX IF NOT EXISTS idx_cycle_notices_household_scope ON public.cycle_notices(household_id, scope, dismissed);
 
 -- 3. Private Helper & Trigger Functions
 CREATE OR REPLACE FUNCTION private.set_updated_at()
@@ -341,6 +355,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON public.household_members TO authenticate
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.budget_items TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.spend_logs TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.monthly_snapshots TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.cycle_notices TO authenticated;
 
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.households ENABLE ROW LEVEL SECURITY;
@@ -348,6 +363,7 @@ ALTER TABLE public.household_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.budget_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.spend_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.monthly_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.cycle_notices ENABLE ROW LEVEL SECURITY;
 
 -- Profiles Policies
 CREATE POLICY "profiles_select_own_or_co_member" ON public.profiles
@@ -460,6 +476,24 @@ CREATE POLICY "monthly_snapshots_member_update" ON public.monthly_snapshots
 CREATE POLICY "monthly_snapshots_member_delete" ON public.monthly_snapshots
     FOR DELETE TO authenticated
     USING (private.is_household_member(household_id));
+
+-- Cycle Notices Policies (strictly scoped like budget_items)
+CREATE POLICY "cycle_notices_member_select" ON public.cycle_notices
+    FOR SELECT TO authenticated
+    USING (private.can_access_budget_scope(household_id, scope));
+
+CREATE POLICY "cycle_notices_member_insert" ON public.cycle_notices
+    FOR INSERT TO authenticated
+    WITH CHECK (private.can_access_budget_scope(household_id, scope));
+
+CREATE POLICY "cycle_notices_member_update" ON public.cycle_notices
+    FOR UPDATE TO authenticated
+    USING (private.can_access_budget_scope(household_id, scope))
+    WITH CHECK (private.can_access_budget_scope(household_id, scope));
+
+CREATE POLICY "cycle_notices_member_delete" ON public.cycle_notices
+    FOR DELETE TO authenticated
+    USING (private.can_access_budget_scope(household_id, scope));
 
 -- 5. Controlled Household RPCs
 CREATE OR REPLACE FUNCTION public.create_household_rpc(
@@ -637,18 +671,188 @@ GRANT EXECUTE ON FUNCTION public.create_household_rpc(TEXT, TEXT, TEXT, TEXT, TE
 GRANT EXECUTE ON FUNCTION public.join_household_rpc(TEXT, TEXT) TO authenticated;
 GRANT EXECUTE ON FUNCTION public.regenerate_invite_code_rpc(UUID) TO authenticated;
 
+CREATE OR REPLACE FUNCTION public.perform_cycle_rollover_rpc(
+    p_household_id UUID,
+    p_current_cycle TEXT,
+    p_prev_label TEXT DEFAULT ''
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO ''
+AS $$
+DECLARE
+    v_uid UUID := auth.uid();
+    v_hh public.households;
+    v_prev TEXT;
+    v_prev_label TEXT;
+    v_pot_totals JSONB := '{}'::jsonb;
+    v_pot_budgets JSONB := '{}'::jsonb;
+    v_total_pot_spent NUMERIC(12, 2) := 0;
+    v_total_pot_budget NUMERIC(12, 2) := 0;
+    v_joint_bills_total NUMERIC(12, 2) := 0;
+    v_pot_spent NUMERIC(12, 2);
+    r_pot RECORD;
+    v_scope TEXT;
+    v_unpaid JSONB;
+BEGIN
+    IF v_uid IS NULL THEN
+        RAISE EXCEPTION 'Authentication required';
+    END IF;
+    IF NOT private.is_household_member(p_household_id) THEN
+        RAISE EXCEPTION 'Access denied';
+    END IF;
+    IF COALESCE(p_current_cycle, '') !~ '^\d{4}-\d{2}$' THEN
+        RAISE EXCEPTION 'Invalid cycle key: %', p_current_cycle;
+    END IF;
+
+    SELECT * INTO v_hh
+      FROM public.households
+     WHERE id = p_household_id
+     FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Household not found';
+    END IF;
+
+    IF COALESCE(v_hh.last_rollover_cycle, '') = '' THEN
+        UPDATE public.households
+           SET last_rollover_cycle = p_current_cycle,
+               active_month = 'current'
+         WHERE id = p_household_id;
+        RETURN jsonb_build_object('rolled_over', false, 'initialized', true, 'cycle', p_current_cycle);
+    END IF;
+
+    IF v_hh.last_rollover_cycle >= p_current_cycle THEN
+        RETURN jsonb_build_object('rolled_over', false, 'already_current', true, 'cycle', v_hh.last_rollover_cycle);
+    END IF;
+
+    v_prev := v_hh.last_rollover_cycle;
+    v_prev_label := COALESCE(NULLIF(trim(p_prev_label), ''), v_prev);
+
+    FOR r_pot IN
+        SELECT name, amount
+          FROM public.budget_items
+         WHERE household_id = p_household_id
+           AND scope = 'joint'
+           AND section = 'budgeted_expense'
+         ORDER BY sort_order, created_at
+    LOOP
+        SELECT COALESCE(sum(amount), 0)
+          INTO v_pot_spent
+          FROM public.spend_logs
+         WHERE household_id = p_household_id
+           AND month_key = v_prev
+           AND pot_name = r_pot.name;
+
+        v_pot_totals := v_pot_totals || jsonb_build_object(r_pot.name, round(v_pot_spent, 2));
+        v_pot_budgets := v_pot_budgets || jsonb_build_object(r_pot.name, round(COALESCE(r_pot.amount, 0), 2));
+        v_total_pot_spent := v_total_pot_spent + COALESCE(v_pot_spent, 0);
+        v_total_pot_budget := v_total_pot_budget + COALESCE(r_pot.amount, 0);
+    END LOOP;
+
+    SELECT COALESCE(sum(amount), 0)
+      INTO v_joint_bills_total
+      FROM public.budget_items
+     WHERE household_id = p_household_id
+       AND scope = 'joint'
+       AND section IN ('regular_expense', 'budgeted_expense', 'prepayment');
+
+    INSERT INTO public.monthly_snapshots (household_id, month_key, label, pot_totals, summary_json)
+    VALUES (
+        p_household_id,
+        v_prev,
+        v_prev_label,
+        v_pot_totals,
+        jsonb_build_object(
+            'pot_budgets', v_pot_budgets,
+            'total_pot_spent', round(v_total_pot_spent, 2),
+            'total_pot_budget', round(v_total_pot_budget, 2),
+            'joint_expenditure', round(v_joint_bills_total, 2)
+        )
+    )
+    ON CONFLICT (household_id, month_key)
+    DO UPDATE SET
+        label = EXCLUDED.label,
+        pot_totals = EXCLUDED.pot_totals,
+        summary_json = EXCLUDED.summary_json;
+
+    FOREACH v_scope IN ARRAY ARRAY['joint', 'partner_a', 'partner_b']
+    LOOP
+        IF v_scope = 'joint' THEN
+            SELECT COALESCE(
+                jsonb_agg(jsonb_build_object('id', id, 'name', name, 'amount', amount, 'section', section) ORDER BY sort_order, created_at),
+                '[]'::jsonb
+            )
+              INTO v_unpaid
+              FROM public.budget_items
+             WHERE household_id = p_household_id
+               AND scope = 'joint'
+               AND section IN ('regular_expense', 'prepayment')
+               AND is_paid = FALSE
+               AND amount > 0;
+        ELSE
+            SELECT COALESCE(
+                jsonb_agg(jsonb_build_object('id', id, 'name', name, 'amount', amount, 'section', section) ORDER BY sort_order, created_at),
+                '[]'::jsonb
+            )
+              INTO v_unpaid
+              FROM public.budget_items
+             WHERE household_id = p_household_id
+               AND scope = v_scope
+               AND section IN ('debt', 'personal_bill', 'savings', 'personal_budgeted')
+               AND is_paid = FALSE
+               AND amount > 0;
+        END IF;
+
+        IF jsonb_array_length(v_unpaid) > 0 THEN
+            INSERT INTO public.cycle_notices (household_id, scope, cycle_key, cycle_label, unpaid_items, dismissed)
+            VALUES (p_household_id, v_scope, v_prev, v_prev_label, v_unpaid, FALSE)
+            ON CONFLICT (household_id, scope, cycle_key)
+            DO UPDATE SET
+                cycle_label = EXCLUDED.cycle_label,
+                unpaid_items = EXCLUDED.unpaid_items,
+                dismissed = FALSE;
+        END IF;
+    END LOOP;
+
+    UPDATE public.budget_items
+       SET is_paid = FALSE,
+           actual_amount = CASE
+               WHEN section IN ('debt', 'regular_expense') THEN NULL
+               ELSE actual_amount
+           END
+     WHERE household_id = p_household_id
+       AND section IN ('regular_expense', 'prepayment', 'debt', 'personal_bill', 'savings');
+
+    UPDATE public.households
+       SET last_rollover_cycle = p_current_cycle,
+           active_month = 'current'
+     WHERE id = p_household_id;
+
+    RETURN jsonb_build_object(
+        'rolled_over', true,
+        'archived_cycle', v_prev,
+        'new_cycle', p_current_cycle
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.perform_cycle_rollover_rpc(UUID, TEXT, TEXT) TO authenticated;
+
 -- 6. Realtime Publication & Replica Identity
 ALTER TABLE public.households REPLICA IDENTITY FULL;
 ALTER TABLE public.household_members REPLICA IDENTITY FULL;
 ALTER TABLE public.budget_items REPLICA IDENTITY FULL;
 ALTER TABLE public.spend_logs REPLICA IDENTITY FULL;
 ALTER TABLE public.monthly_snapshots REPLICA IDENTITY FULL;
+ALTER TABLE public.cycle_notices REPLICA IDENTITY FULL;
 
 DO $$
 DECLARE
     t TEXT;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['households', 'household_members', 'budget_items', 'spend_logs', 'monthly_snapshots']
+    FOREACH t IN ARRAY ARRAY['households', 'household_members', 'budget_items', 'spend_logs', 'monthly_snapshots', 'cycle_notices']
     LOOP
         IF NOT EXISTS (
             SELECT 1
