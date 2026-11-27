@@ -4,9 +4,9 @@ import {
   FREQUENCY_OPTIONS,
   computeBudgetModel,
   computeMonthlyAmount,
-} from './budget-engine.js?v=5';
+} from './budget-engine.js?v=6';
 
-const APP_VERSION = '1.5';
+const APP_VERSION = '1.6';
 
 const SUPABASE_URL = 'https://rpegjcnwtsjdbqrxxzrm.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_3QFbL-uHbTadq5eQpUdDiA_hTicgtOL';
@@ -319,6 +319,15 @@ async function loadProfileAndHousehold() {
   renderAll();
 }
 
+function getMyPartnerSlot() {
+  const myMembership = state.members.find((m) => m.user_id === state.user?.id);
+  return myMembership?.partner_slot === 'b' ? 'b' : 'a';
+}
+
+function getMyPersonalScope() {
+  return getMyPartnerSlot() === 'b' ? 'partner_b' : 'partner_a';
+}
+
 async function fetchHouseholdData(householdId) {
   const [hhRes, memRes, itemsRes, logsRes, snapRes] = await Promise.all([
     sb.from('households').select('*').eq('id', householdId).single(),
@@ -344,12 +353,8 @@ async function fetchHouseholdData(householdId) {
     state.selectedMonth = state.household.active_month || currentYearMonth();
   }
 
-  // Default personal tab to caller's partner slot
-  const myMembership = state.members.find((m) => m.user_id === state.user?.id);
-  if (myMembership && !state._personalPickedOnce) {
-    state.personalScope = myMembership.partner_slot === 'b' ? 'partner_b' : 'partner_a';
-    state._personalPickedOnce = true;
-  }
+  // Always lock personal view strictly to the authenticated user's own partner slot
+  state.personalScope = getMyPersonalScope();
 
   $('topbar-sub').textContent = `${state.household.name} · Code ${state.household.invite_code}`;
   updateSyncBar();
@@ -509,6 +514,12 @@ async function runMutation(op, toastMsg) {
     }
   };
 
+  const targetScope =
+    op.table === 'budget_items'
+      ? op.payload?.scope || state.items.find((i) => i.id === op.id)?.scope
+      : 'joint';
+  const isPrivateOp = targetScope === 'partner_a' || targetScope === 'partner_b';
+
   applyOptimisticState(op);
   renderAll();
 
@@ -524,11 +535,9 @@ async function runMutation(op, toastMsg) {
     await executeOp(op);
     await fetchHouseholdData(state.household.id);
     renderAll();
-    if (toastMsg) {
-      showToast(toastMsg);
-      broadcastChange(`${actorName || 'Partner'}: ${toastMsg}`);
-    } else {
-      broadcastChange(`${actorName || 'Partner'} updated the budget`);
+    if (toastMsg) showToast(toastMsg);
+    if (!isPrivateOp) {
+      broadcastChange(toastMsg ? `${actorName || 'Partner'}: ${toastMsg}` : `${actorName || 'Partner'} updated the budget`);
     }
   } catch (err) {
     if (!navigator.onLine || String(err?.message || '').toLowerCase().includes('fetch')) {
@@ -591,12 +600,14 @@ async function importJSONBackup(file) {
     throw new Error('Invalid Reste backup JSON file.');
   }
   const h = state.household;
+  const myScope = getMyPersonalScope();
   const actorName = state.profile?.display_name || state.profile?.username || '';
-  if (!confirm(`Import ${parsed.items.length} budget item(s) into "${h.name}"? This replaces current items in this household.`)) {
+  const importable = parsed.items.filter((it) => it.scope === 'joint' || it.scope === myScope);
+  if (!confirm(`Import ${importable.length} budget item(s) into "${h.name}"? This replaces joint and your personal items.`)) {
     return;
   }
 
-  await sb.from('budget_items').delete().eq('household_id', h.id).throwOnError();
+  await sb.from('budget_items').delete().eq('household_id', h.id).in('scope', ['joint', myScope]).throwOnError();
   await sb.from('spend_logs').delete().eq('household_id', h.id).throwOnError();
   await sb.from('monthly_snapshots').delete().eq('household_id', h.id).throwOnError();
 
@@ -623,7 +634,7 @@ async function importJSONBackup(file) {
       .throwOnError();
   }
 
-  const itemsPayload = parsed.items.map((it) => ({
+  const itemsPayload = importable.map((it) => ({
     household_id: h.id,
     scope: it.scope,
     section: it.section,
@@ -975,7 +986,9 @@ function bindSplitSlider(rootEl) {
     setAll('[data-live-extra-b]', fmtMoney(live.partnerB.jointExtra));
     setAll('[data-live-transfer-a]', fmtMoney(live.transferA));
     setAll('[data-live-transfer-b]', fmtMoney(live.transferB));
-    setAll('[data-live-joint-reste]', fmtMoney(live.jointDisposable));
+    setAll('[data-live-joint-reste], [data-live-joint-reste-hero]', fmtMoney(live.jointDisposable));
+    const myPartner = getMyPersonalScope() === 'partner_b' ? live.partnerB : live.partnerA;
+    setAll('[data-live-my-reste]', fmtMoney(myPartner.disposable));
     setAll('[data-live-pa-reste]', fmtMoney(live.partnerA.disposable));
     setAll('[data-live-pb-reste]', fmtMoney(live.partnerB.disposable));
     setAll('[data-live-total-reste]', fmtMoney(live.totalHouseholdDisposable));
@@ -1011,9 +1024,13 @@ function bindSplitSlider(rootEl) {
 
 function renderOverview(m, activeMonth) {
   const h = state.household;
-  const pA = h.partner_a_name || 'Partner A';
-  const pB = h.partner_b_name || 'Partner B';
-  const totalOutNeg = -Math.abs(m.totalHouseholdExpenditure);
+  const pA = h.partner_a_name || 'Partner 1';
+  const pB = h.partner_b_name || 'Partner 2';
+  const myScope = getMyPersonalScope();
+  const isMeB = myScope === 'partner_b';
+  const myName = isMeB ? pB : pA;
+  const myPartner = isMeB ? m.partnerB : m.partnerA;
+  const jointOutNeg = -Math.abs(m.jointExpenseSubtotal);
 
   const potHtml = m.potTrackers.length
     ? m.potTrackers
@@ -1064,28 +1081,24 @@ function renderOverview(m, activeMonth) {
     <div class="hero-card">
       <div class="hero-top">
         <div>
-          <div class="hero-kicker">Monthly Household Reste</div>
-          <div class="hero-amount ${m.totalHouseholdDisposable < 0 ? 'neg' : ''}" data-live-total-reste>${fmtMoney(m.totalHouseholdDisposable)}</div>
+          <div class="hero-kicker">Monthly Joint Reste</div>
+          <div class="hero-amount ${m.jointDisposable < 0 ? 'neg' : ''}" data-live-joint-reste-hero>${fmtMoney(m.jointDisposable)}</div>
         </div>
         <button class="btn btn-sm" id="ov-log-spend-btn" style="background:rgba(255,255,255,0.14);border-color:rgba(255,255,255,0.22);color:#faf7f0;">+ Log Spend</button>
       </div>
       <div class="hero-meta-row">
-        <span>Income <strong class="num">${fmtMoney(m.totalHouseholdIncome)}</strong></span>
-        <span>Expenses <strong class="num">${fmtMoney(totalOutNeg)}</strong></span>
-        <span>Joint Out <strong class="num">${fmtMoney(m.jointExpenseSubtotal)}</strong></span>
+        <span>Household Income <strong class="num">${fmtMoney(m.totalHouseholdIncome)}</strong></span>
+        <span>Joint Inflow <strong class="num">${fmtMoney(m.jointAccountInflow)}</strong></span>
+        <span>Joint Out <strong class="num">${fmtMoney(jointOutNeg)}</strong></span>
       </div>
       <div class="hero-pills">
         <button class="hero-pill" data-jump-tab="joint" type="button">
           <span class="hero-pill-lbl">Joint Reste</span>
           <span class="hero-pill-val" data-live-joint-reste>${fmtMoney(m.jointDisposable)}</span>
         </button>
-        <button class="hero-pill" data-jump-personal="partner_a" type="button">
-          <span class="hero-pill-lbl">${esc(pA)}'s Reste</span>
-          <span class="hero-pill-val" data-live-pa-reste>${fmtMoney(m.partnerA.disposable)}</span>
-        </button>
-        <button class="hero-pill" data-jump-personal="partner_b" type="button">
-          <span class="hero-pill-lbl">${esc(pB)}'s Reste</span>
-          <span class="hero-pill-val" data-live-pb-reste>${fmtMoney(m.partnerB.disposable)}</span>
+        <button class="hero-pill" data-jump-tab="personal" type="button">
+          <span class="hero-pill-lbl">${esc(myName)}'s Reste (Private)</span>
+          <span class="hero-pill-val" data-live-my-reste>${fmtMoney(myPartner.disposable)}</span>
         </button>
       </div>
     </div>
@@ -1118,12 +1131,6 @@ function renderOverview(m, activeMonth) {
   $('ov-open-spend-btn')?.addEventListener('click', () => setActiveTab('spend'));
   $('panel-overview').querySelectorAll('[data-jump-tab]').forEach((b) =>
     b.addEventListener('click', () => setActiveTab(b.dataset.jumpTab))
-  );
-  $('panel-overview').querySelectorAll('[data-jump-personal]').forEach((b) =>
-    b.addEventListener('click', () => {
-      state.personalScope = b.dataset.jumpPersonal;
-      setActiveTab('personal');
-    })
   );
   $('panel-overview').querySelectorAll('[data-log-pot]').forEach((btn) =>
     btn.addEventListener('click', (e) => {
@@ -1632,7 +1639,8 @@ function renderPersonal(m) {
   const h = state.household;
   const pAName = h.partner_a_name || 'Partner 1';
   const pBName = h.partner_b_name || 'Partner 2';
-  const scope = state.personalScope;
+  const scope = getMyPersonalScope();
+  state.personalScope = scope;
   const isA = scope === 'partner_a';
   const partnerName = isA ? pAName : pBName;
   const p = isA ? m.partnerA : m.partnerB;
@@ -1732,21 +1740,13 @@ function renderPersonal(m) {
   };
 
   $('panel-personal').innerHTML = `
-    <div class="seg-tabs">
-      <button class="seg-tab ${isA ? 'on' : ''}" data-switch-personal="partner_a" type="button">
-        ${esc(pAName)} · <span class="num">${fmtMoney(m.partnerA.disposable)}</span>
-      </button>
-      <button class="seg-tab ${!isA ? 'on' : ''}" data-switch-personal="partner_b" type="button">
-        ${esc(pBName)} · <span class="num">${fmtMoney(m.partnerB.disposable)}</span>
-      </button>
-    </div>
-
     <div class="card">
       <div class="sec-hdr">
         <div>
           <div class="sec-title">${esc(partnerName)}'s Monthly Reste</div>
-          <div class="sec-sub">Transfer auto-rounds bills up to nearest £50 + Optional</div>
+          <div class="sec-sub">Private to you · Transfer rounds bills up to £50 + Optional</div>
         </div>
+        <span class="badge emerald">Private</span>
       </div>
       <div style="font-size:28px;font-weight:700;margin:4px 0 10px;" class="num">${fmtMoney(p.disposable)}</div>
       <div class="kv-grid">
@@ -1782,13 +1782,6 @@ function renderPersonal(m) {
     ${renderSection('Personal Bills', 'Direct debits, phone & subscriptions', 'personal_bill', p.bills, false)}
     ${renderSection('Savings & Investments', 'Monthly transfers & pots', 'savings', p.savings, false)}
   `;
-
-  $('panel-personal').querySelectorAll('[data-switch-personal]').forEach((b) =>
-    b.addEventListener('click', () => {
-      state.personalScope = b.dataset.switchPersonal;
-      renderPersonal(m);
-    })
-  );
 
   // Quick-add form inside Personal Budgeted Items
   let pbQuickMode = 'expense';
@@ -1841,7 +1834,6 @@ function renderPersonal(m) {
     }
     await fetchHouseholdData(h.id);
     renderAll();
-    broadcastChange('Cleared finished personal budgeted items');
     showToast(`Cleared ${finished.length} finished item(s)`);
   });
 
@@ -1905,13 +1897,24 @@ function renderHouseholdTab(m) {
       </div>
       <div class="item-list">${membersHtml}</div>
       ${myMem
-      ? `<div style="margin-top:12px;display:flex;gap:8px;align-items:center;justify-content:space-between;">
-              <span style="font-size:12.5px;color:var(--ink2);">Your default personal view:</span>
-              <div style="display:flex;gap:6px;">
-                <button class="btn btn-sm ${myMem.partner_slot === 'a' ? 'btn-primary' : ''}" data-set-slot="a" type="button">${esc(h.partner_a_name)}</button>
-                <button class="btn btn-sm ${myMem.partner_slot === 'b' ? 'btn-primary' : ''}" data-set-slot="b" type="button">${esc(h.partner_b_name)}</button>
-              </div>
-            </div>`
+      ? (() => {
+          const otherSlot = myMem.partner_slot === 'b' ? 'a' : 'b';
+          const otherTaken = state.members.some((mem) => mem.partner_slot === otherSlot && mem.user_id !== state.user?.id);
+          const mySlotName = myMem.partner_slot === 'b' ? h.partner_b_name : h.partner_a_name;
+          if (otherTaken) {
+            return `<div style="margin-top:12px;display:flex;gap:8px;align-items:center;justify-content:space-between;">
+              <span style="font-size:12.5px;color:var(--ink2);">Your private personal profile:</span>
+              <span class="badge emerald">${esc(mySlotName)} (locked)</span>
+            </div>`;
+          }
+          return `<div style="margin-top:12px;display:flex;gap:8px;align-items:center;justify-content:space-between;">
+            <span style="font-size:12.5px;color:var(--ink2);">Your private personal profile:</span>
+            <div style="display:flex;gap:6px;">
+              <button class="btn btn-sm ${myMem.partner_slot === 'a' ? 'btn-primary' : ''}" data-set-slot="a" type="button">${esc(h.partner_a_name)}</button>
+              <button class="btn btn-sm ${myMem.partner_slot === 'b' ? 'btn-primary' : ''}" data-set-slot="b" type="button">${esc(h.partner_b_name)}</button>
+            </div>
+          </div>`;
+        })()
       : ''
     }
     </div>
@@ -2677,17 +2680,19 @@ function downloadFile(filename, content, mime) {
 }
 
 function exportJSON(model) {
+  const myScope = getMyPersonalScope();
+  const myPartner = myScope === 'partner_b' ? model.partnerB : model.partnerA;
   const payload = {
     exported_at: new Date().toISOString(),
     household: state.household,
-    items: state.items,
+    items: state.items.filter((i) => i.scope === 'joint' || i.scope === myScope),
     spend_logs: state.spendLogs,
     snapshots: state.snapshots,
     summary: {
       total_income: model.totalHouseholdIncome,
-      total_expenditure: model.totalHouseholdExpenditure,
-      household_reste: model.totalHouseholdDisposable,
+      joint_expenditure: model.jointExpenseSubtotal,
       joint_reste: model.jointDisposable,
+      my_personal_reste: myPartner.disposable,
     },
   };
   downloadFile(`reste-${state.household.invite_code}.json`, JSON.stringify(payload, null, 2), 'application/json');
@@ -2695,26 +2700,31 @@ function exportJSON(model) {
 }
 
 function exportCSV(model) {
+  const myScope = getMyPersonalScope();
+  const myPartner = myScope === 'partner_b' ? model.partnerB : model.partnerA;
   const rows = [['Scope', 'Section', 'Name', 'Category', 'Amount', 'Partner A', 'Partner B', 'Raw Cost', 'Frequency', 'Actual', 'Paid']];
-  state.items.forEach((i) => {
-    rows.push([
-      i.scope,
-      i.section,
-      `"${String(i.name || '').replace(/"/g, '""')}"`,
-      `"${String(i.category || '').replace(/"/g, '""')}"`,
-      i.amount,
-      i.partner_a_amount,
-      i.partner_b_amount,
-      i.raw_cost ?? '',
-      i.frequency || 'monthly',
-      i.actual_amount ?? '',
-      i.is_paid ? 'Yes' : 'No',
-    ]);
-  });
+  state.items
+    .filter((i) => i.scope === 'joint' || i.scope === myScope)
+    .forEach((i) => {
+      rows.push([
+        i.scope,
+        i.section,
+        `"${String(i.name || '').replace(/"/g, '""')}"`,
+        `"${String(i.category || '').replace(/"/g, '""')}"`,
+        i.amount,
+        i.partner_a_amount,
+        i.partner_b_amount,
+        i.raw_cost ?? '',
+        i.frequency || 'monthly',
+        i.actual_amount ?? '',
+        i.is_paid ? 'Yes' : 'No',
+      ]);
+    });
   rows.push([]);
-  rows.push(['Summary', 'Total Income', model.totalHouseholdIncome.toFixed(2)]);
-  rows.push(['Summary', 'Total Expenses', (-model.totalHouseholdExpenditure).toFixed(2)]);
-  rows.push(['Summary', 'Household Reste', model.totalHouseholdDisposable.toFixed(2)]);
+  rows.push(['Summary', 'Total Household Income', model.totalHouseholdIncome.toFixed(2)]);
+  rows.push(['Summary', 'Joint Expenses', (-model.jointExpenseSubtotal).toFixed(2)]);
+  rows.push(['Summary', 'Joint Reste', model.jointDisposable.toFixed(2)]);
+  rows.push(['Summary', 'My Personal Reste', myPartner.disposable.toFixed(2)]);
   downloadFile(`reste-${state.household.invite_code}.csv`, rows.map((r) => r.join(',')).join('\n'), 'text/csv');
   showToast('CSV exported');
 }

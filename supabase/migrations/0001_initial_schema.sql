@@ -228,6 +228,48 @@ AS $$
     );
 $$;
 
+CREATE OR REPLACE FUNCTION private.can_access_budget_scope(p_household_id UUID, p_scope TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path TO ''
+AS $$
+    SELECT CASE
+        WHEN p_scope = 'joint' THEN private.is_household_member(p_household_id)
+        WHEN p_scope = 'partner_a' THEN EXISTS (
+            SELECT 1 FROM public.household_members hm
+            WHERE hm.household_id = p_household_id
+              AND hm.user_id = (SELECT auth.uid())
+              AND hm.partner_slot = 'a'
+        )
+        WHEN p_scope = 'partner_b' THEN EXISTS (
+            SELECT 1 FROM public.household_members hm
+            WHERE hm.household_id = p_household_id
+              AND hm.user_id = (SELECT auth.uid())
+              AND hm.partner_slot = 'b'
+        )
+        ELSE FALSE
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION private.can_claim_partner_slot(p_household_id UUID, p_user_id UUID, p_slot TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path TO ''
+AS $$
+    SELECT p_user_id = (SELECT auth.uid())
+       AND private.is_household_member(p_household_id)
+       AND NOT EXISTS (
+           SELECT 1 FROM public.household_members hm
+           WHERE hm.household_id = p_household_id
+             AND hm.partner_slot = p_slot
+             AND hm.user_id <> (SELECT auth.uid())
+       );
+$$;
+
 CREATE OR REPLACE FUNCTION private.generate_invite_code()
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -346,8 +388,8 @@ CREATE POLICY "household_members_insert_self" ON public.household_members
 
 CREATE POLICY "household_members_update_member" ON public.household_members
     FOR UPDATE TO authenticated
-    USING (private.is_household_member(household_id))
-    WITH CHECK (private.is_household_member(household_id));
+    USING ((SELECT auth.uid()) = user_id AND private.is_household_member(household_id))
+    WITH CHECK (private.can_claim_partner_slot(household_id, user_id, partner_slot));
 
 CREATE POLICY "household_members_delete_self_or_member" ON public.household_members
     FOR DELETE TO authenticated
@@ -356,20 +398,20 @@ CREATE POLICY "household_members_delete_self_or_member" ON public.household_memb
 -- Budget Items Policies
 CREATE POLICY "budget_items_member_select" ON public.budget_items
     FOR SELECT TO authenticated
-    USING (private.is_household_member(household_id));
+    USING (private.can_access_budget_scope(household_id, scope));
 
 CREATE POLICY "budget_items_member_insert" ON public.budget_items
     FOR INSERT TO authenticated
-    WITH CHECK (private.is_household_member(household_id));
+    WITH CHECK (private.can_access_budget_scope(household_id, scope));
 
 CREATE POLICY "budget_items_member_update" ON public.budget_items
     FOR UPDATE TO authenticated
-    USING (private.is_household_member(household_id))
-    WITH CHECK (private.is_household_member(household_id));
+    USING (private.can_access_budget_scope(household_id, scope))
+    WITH CHECK (private.can_access_budget_scope(household_id, scope));
 
 CREATE POLICY "budget_items_member_delete" ON public.budget_items
     FOR DELETE TO authenticated
-    USING (private.is_household_member(household_id));
+    USING (private.can_access_budget_scope(household_id, scope));
 
 -- Spend Logs Policies
 CREATE POLICY "spend_logs_member_select" ON public.spend_logs
