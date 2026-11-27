@@ -53,6 +53,101 @@ export const FREQUENCY_OPTIONS = [
   { value: 'weekly', label: 'Weekly', divisor: 12 / 52 },
 ];
 
+export function daysInMonth(year, month1Based) {
+  return new Date(year, month1Based, 0).getDate();
+}
+
+export function clampPayday(paydayDay) {
+  const n = parseInt(paydayDay, 10);
+  if (Number.isNaN(n) || n < 1) return 1;
+  return Math.min(31, n);
+}
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+function addMonthsYM(year, month1Based, delta) {
+  const idx = year * 12 + (month1Based - 1) + delta;
+  const ny = Math.floor(idx / 12);
+  const nm = (idx % 12) + 1;
+  return [ny, nm];
+}
+
+export function getCycleKeyForDate(dateISO, paydayDay = 1) {
+  const pDay = clampPayday(paydayDay);
+  const m = String(dateISO || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return String(dateISO || '').slice(0, 7);
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (pDay <= 1) return `${y}-${pad2(mo)}`;
+  const startDay = Math.min(pDay, daysInMonth(y, mo));
+  if (d >= startDay) return `${y}-${pad2(mo)}`;
+  const [py, pm] = addMonthsYM(y, mo, -1);
+  return `${py}-${pad2(pm)}`;
+}
+
+export function getCurrentCycleKey(paydayDay = 1, now = new Date()) {
+  const localISO = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
+  return getCycleKeyForDate(localISO, paydayDay);
+}
+
+export function resolveActiveCycleKey(household, now = new Date()) {
+  const raw = household?.active_month;
+  if (!raw || raw === 'current' || !/^\d{4}-\d{2}$/.test(raw)) {
+    return getCurrentCycleKey(household?.payday_day, now);
+  }
+  return raw;
+}
+
+export function getCycleRange(cycleKey, paydayDay = 1) {
+  const pDay = clampPayday(paydayDay);
+  const m = String(cycleKey || '').match(/^(\d{4})-(\d{2})$/);
+  if (!m) {
+    return {
+      cycleKey: cycleKey || '',
+      startISO: '',
+      endISO: '',
+      shortLabel: cycleKey || 'Current Cycle',
+      fullLabel: cycleKey || 'Current Cycle',
+    };
+  }
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const monthsShort = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  if (pDay <= 1) {
+    const lastD = daysInMonth(y, mo);
+    const startISO = `${y}-${pad2(mo)}-01`;
+    const endISO = `${y}-${pad2(mo)}-${pad2(lastD)}`;
+    const mName = monthsShort[mo - 1];
+    return {
+      cycleKey,
+      startISO,
+      endISO,
+      shortLabel: `${mName} ${y}`,
+      fullLabel: `1 ${mName} – ${lastD} ${mName} ${y}`,
+    };
+  }
+
+  const startD = Math.min(pDay, daysInMonth(y, mo));
+  const [ny, nm] = addMonthsYM(y, mo, 1);
+  const nextPayD = Math.min(pDay, daysInMonth(ny, nm));
+  const endDate = new Date(ny, nm - 1, nextPayD - 1);
+  const ey = endDate.getFullYear();
+  const em = endDate.getMonth() + 1;
+  const ed = endDate.getDate();
+
+  const startISO = `${y}-${pad2(mo)}-${pad2(startD)}`;
+  const endISO = `${ey}-${pad2(em)}-${pad2(ed)}`;
+  const smName = monthsShort[mo - 1];
+  const emName = monthsShort[em - 1];
+  const shortLabel = `${startD} ${smName} – ${ed} ${emName}`;
+  const fullLabel = y === ey ? `${startD} ${smName} – ${ed} ${emName} ${ey}` : `${startD} ${smName} ${y} – ${ed} ${emName} ${ey}`;
+  return { cycleKey, startISO, endISO, shortLabel, fullLabel };
+}
+
 export function roundUpToNearest(amount, step = 50) {
   const clean = Number(Number(amount || 0).toFixed(6));
   if (clean <= 0) return 0;
@@ -240,7 +335,16 @@ export function computeBudgetModel(household, items, spendLogs, activeMonth) {
   const totalHouseholdExpenditure = jointExpenseSubtotal + partnerA.nonJointOutgoings + partnerB.nonJointOutgoings;
   const totalHouseholdDisposable = totalHouseholdIncome - totalHouseholdExpenditure;
 
-  const monthLogs = activeMonth ? logs.filter((l) => l.month_key === activeMonth) : logs;
+  const paydayDay = clampPayday(h.payday_day ?? 1);
+  const activeCycleKey = !activeMonth || activeMonth === 'current' ? resolveActiveCycleKey(h) : activeMonth;
+  const cycleRange = getCycleRange(activeCycleKey, paydayDay);
+
+  const monthLogs = activeCycleKey
+    ? logs.filter((l) => {
+        const key = l.spend_date ? getCycleKeyForDate(l.spend_date, paydayDay) : l.month_key;
+        return key === activeCycleKey;
+      })
+    : logs;
   const potActuals = {};
   monthLogs.forEach((l) => {
     const key = l.pot_name || 'Other';
@@ -274,6 +378,9 @@ export function computeBudgetModel(household, items, spendLogs, activeMonth) {
 
   return {
     split: { activeA, activeB, suggestedA, suggestedB },
+    paydayDay,
+    activeCycleKey,
+    cycleRange,
     incomeItems,
     jointDirectIncome,
     partnerAIncome,

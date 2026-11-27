@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS public.households (
     name TEXT NOT NULL DEFAULT 'Our Household',
     invite_code TEXT NOT NULL UNIQUE,
     currency TEXT NOT NULL DEFAULT '£',
-    active_month TEXT NOT NULL DEFAULT '2026-11',
+    active_month TEXT NOT NULL DEFAULT 'current',
+    payday_day INTEGER NOT NULL DEFAULT 1 CHECK (payday_day >= 1 AND payday_day <= 31),
     partner_a_name TEXT NOT NULL DEFAULT 'Partner 1',
     partner_b_name TEXT NOT NULL DEFAULT 'Partner 2',
     split_mode TEXT NOT NULL DEFAULT 'custom' CHECK (split_mode IN ('custom', 'suggested', 'equal')),
@@ -466,7 +467,7 @@ CREATE OR REPLACE FUNCTION public.create_household_rpc(
     p_partner_a_name TEXT DEFAULT 'Partner A',
     p_partner_b_name TEXT DEFAULT 'Partner B',
     p_currency TEXT DEFAULT '£',
-    p_active_month TEXT DEFAULT '2026-11',
+    p_active_month TEXT DEFAULT 'current',
     p_expense_categories JSONB DEFAULT '[]'::jsonb,
     p_income_categories JSONB DEFAULT '[]'::jsonb
 )
@@ -508,7 +509,7 @@ BEGIN
         COALESCE(NULLIF(trim(p_name), ''), 'Our Household'),
         v_code,
         COALESCE(NULLIF(trim(p_currency), ''), '£'),
-        COALESCE(NULLIF(trim(p_active_month), ''), '2026-11'),
+        COALESCE(NULLIF(trim(p_active_month), ''), 'current'),
         COALESCE(NULLIF(trim(p_partner_a_name), ''), 'Partner A'),
         COALESCE(NULLIF(trim(p_partner_b_name), ''), 'Partner B'),
         COALESCE(p_expense_categories, '[]'::jsonb),

@@ -9,6 +9,7 @@
 - **Interactive Split Slider & Auto £50 Transfers**: Scrub the bill percentage split slider cleanly (or pick `50 / 50 Equal` or `Income Match`). Each partner's joint bills share automatically rounds up to the nearest `£50` (`Round-Up Extra`) plus any optional `+/-` adjustment to calculate the live Joint Transfer.
 - **Tap-to-Amend Inline Editing**: Tap any value pill across Overview, Joint, Spend, or Personal tabs to amend numbers directly in place (including `±` negative credit toggles where applicable).
 - **Strictly Private Personal Sections**: Each partner sees only their own Personal section (budgeted items, debt repayment, personal bills, savings) enforced both in the client and at the database level via PostgreSQL Row-Level Security (`private.can_access_budget_scope`), plus quick Expense (`+`) / Credit (`-`) tracking and one-tap completion.
+- **Flexible & Future-Proof**: Add unlimited income sources, bills, spending pots, prepayments (weekly to annually), custom payday billing cycles (e.g. 20th–19th, synced live across both partners), an interactive category pie chart on Overview, custom categories, per-item split overrides, and JSON/CSV exports.
 - **Permanent Cloud Persistence & Backups**: All records are saved in Supabase PostgreSQL with RLS. Clearing browser cache or switching devices never loses data, and full JSON/CSV exports & imports are built in.
 
 ## Hosting & Running

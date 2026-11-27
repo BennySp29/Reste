@@ -20,7 +20,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&family=Playfair+Display:ital,wght@0,600;0,700;1,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./styles.css?v=8" />
+  <link rel="stylesheet" href="./styles.css?v=9" />
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
@@ -132,6 +132,16 @@
                 <input class="fi" id="create-pb-name" type="text" placeholder="e.g. Partner 2" required />
               </div>
             </div>
+            <div class="fg">
+              <label class="fl" for="create-payday-day">Monthly Payday / Budget Start Day</label>
+              <select class="fi" id="create-payday-day">
+                <option value="1" selected>1st (Calendar month)</option>
+                <option value="20">20th (20th to 19th)</option>
+                <option value="25">25th (25th to 24th)</option>
+                <option value="28">28th (28th to 27th)</option>
+                <option value="15">15th (15th to 14th)</option>
+              </select>
+            </div>
             <button class="btn btn-primary btn-full" type="submit" id="create-hh-btn">Create Household</button>
           </form>
         </div>
@@ -208,6 +218,6 @@
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-  <script type="module" src="./app.js?v=8"></script>
+  <script type="module" src="./app.js?v=9"></script>
 </body>
 </html>
