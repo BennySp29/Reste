@@ -9,9 +9,9 @@ import {
   getCurrentCycleKey,
   getCycleKeyForDate,
   getCycleRange,
-} from './budget-engine.js?v=10';
+} from './budget-engine.js?v=11';
 
-const APP_VERSION = '2.0';
+const APP_VERSION = '2.1';
 
 const SUPABASE_URL = 'https://rpegjcnwtsjdbqrxxzrm.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_3QFbL-uHbTadq5eQpUdDiA_hTicgtOL';
@@ -822,8 +822,6 @@ function showView(view) {
 
   const isApp = view === 'app';
   $('bottom-nav').classList.toggle('hidden', !isApp);
-  $('quick-spend-top').classList.toggle('hidden', !isApp);
-  $('account-top-btn').classList.toggle('hidden', !isApp);
   $('sync-bar').classList.toggle('hidden', !isApp);
 
   if (view === 'loading') $('view-loading').classList.remove('hidden');
@@ -3010,9 +3008,6 @@ function bindGlobalEvents() {
     localStorage.setItem('reste_dark', state.darkMode ? '1' : '0');
     applyDarkMode();
   });
-
-  $('quick-spend-top').addEventListener('click', () => openSpendModal());
-  $('account-top-btn').addEventListener('click', () => setActiveTab('household'));
 
   document.querySelectorAll('.nav-item').forEach((btn) =>
     btn.addEventListener('click', () => setActiveTab(btn.dataset.tab))
