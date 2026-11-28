@@ -20,7 +20,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&family=Playfair+Display:ital,wght@0,600;0,700;1,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="./styles.css?v=11" />
+  <link rel="stylesheet" href="./styles.css?v=12" />
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
@@ -30,7 +30,11 @@
         <div class="brand-badge" aria-hidden="true">R</div>
         <div>
           <div class="topbar-title">Reste</div>
-          <div class="topbar-sub" id="topbar-sub">Household Budget Planner</div>
+          <div class="topbar-sub-row">
+            <span class="topbar-live-dot hidden" id="topbar-live-dot" aria-hidden="true"></span>
+            <span class="topbar-sub" id="topbar-sub">Household Budget Planner</span>
+            <span class="presence-pill-inline hidden" id="presence-pill"></span>
+          </div>
         </div>
       </div>
       <div class="topbar-right">
@@ -38,12 +42,11 @@
       </div>
     </header>
 
-    <div class="sync-bar hidden" id="sync-bar">
+    <div class="sync-bar off hidden" id="sync-bar">
       <div class="sync-bar-left">
         <div class="sync-dot"></div>
-        <span id="sync-txt">Connecting to live sync…</span>
+        <span id="sync-txt">Offline — viewing saved snapshot</span>
       </div>
-      <span class="presence-pill hidden" id="presence-pill"></span>
     </div>
 
     <main class="content" id="main-content">
@@ -216,6 +219,6 @@
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-  <script type="module" src="./app.js?v=11"></script>
+  <script type="module" src="./app.js?v=12"></script>
 </body>
 </html>

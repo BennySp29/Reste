@@ -148,6 +148,25 @@ export function getCycleRange(cycleKey, paydayDay = 1) {
   return { cycleKey, startISO, endISO, shortLabel, fullLabel };
 }
 
+export function getCyclePace(cycleRange, now = new Date()) {
+  const parseLocal = (iso) => {
+    const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return null;
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  };
+  const start = parseLocal(cycleRange?.startISO);
+  const end = parseLocal(cycleRange?.endISO);
+  if (!start || !end) {
+    return { totalDays: 30, elapsedDays: 1, daysLeft: 29, pacePct: 0 };
+  }
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const totalDays = Math.max(1, Math.round((end - start) / 86400000) + 1);
+  const elapsedDays = Math.min(totalDays, Math.max(0, Math.round((today - start) / 86400000) + 1));
+  const daysLeft = Math.max(0, totalDays - elapsedDays);
+  const pacePct = Math.min(100, Math.max(0, (elapsedDays / totalDays) * 100));
+  return { totalDays, elapsedDays, daysLeft, pacePct };
+}
+
 export function roundUpToNearest(amount, step = 50) {
   const clean = Number(Number(amount || 0).toFixed(6));
   if (clean <= 0) return 0;
@@ -338,6 +357,7 @@ export function computeBudgetModel(household, items, spendLogs, activeMonth) {
   const paydayDay = clampPayday(h.payday_day ?? 1);
   const activeCycleKey = !activeMonth || activeMonth === 'current' ? resolveActiveCycleKey(h) : activeMonth;
   const cycleRange = getCycleRange(activeCycleKey, paydayDay);
+  const cyclePace = getCyclePace(cycleRange);
 
   const monthLogs = activeCycleKey
     ? logs.filter((l) => {
@@ -381,6 +401,7 @@ export function computeBudgetModel(household, items, spendLogs, activeMonth) {
     paydayDay,
     activeCycleKey,
     cycleRange,
+    cyclePace,
     incomeItems,
     jointDirectIncome,
     partnerAIncome,
